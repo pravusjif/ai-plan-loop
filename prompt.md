@@ -1,0 +1,86 @@
+We are working through the plan in @{{PLAN}}, unattended, on branch `{{BRANCH}}`.
+Read CLAUDE.md (if the repo has one) and @{{PLAN}} in full before touching anything. The plan
+says what to build, in what order, and how a milestone is verified and recorded. Where the plan
+or the repo's own instructions are more specific than this prompt, follow them.
+
+Implement the next milestone (or task) in the plan that is not done yet, verify it, record it in
+the plan, and commit it. {{NEXT_HINT}} {{SCOPE}}
+
+Any design question that would normally go to the user, you decide autonomously, the way the
+plan's existing decisions point. Record each such decision in {{PLAN}}.
+
+---
+
+## Loop protocol
+
+You are one link in an unattended chain. A driver script (`plan_loop.py`)
+started this session and will start others after it. Nothing carries between sessions except
+what is on disk, so `{{PLAN}}` is not documentation of your work: it *is* the handoff. A
+milestone you land but do not write up is a milestone the next session redoes.
+
+**One milestone per turn.** Do exactly one milestone, then end your turn with the
+`LOOP_STATUS` line below. Do not start a second one in the same turn, even if the first went
+quickly. After your turn the driver measures this session's context: under {{THRESHOLD}} it sends
+you the next milestone in this same session, otherwise it ends the session and a fresh one
+continues. That is the driver's decision, not yours.
+
+**Start by checking the working tree.** Run `git status` and `git log --oneline -5`. If the
+tree is dirty, a previous session was cut off mid-milestone (usage limit, timeout, crash). Read
+the diff, decide whether it is sound, and finish it or revert it deliberately. Never commit it
+blindly.
+
+**Scope.** Take the first milestone that is not done, honouring the dependencies the plan
+names. Do not silently substitute a different one: if it is genuinely blocked (it needs a human,
+a missing tool, a decision only the owner can make), mark it blocked in the plan naming the
+blocker, take the next unblocked one, and name the swap in your `LOOP_STATUS` line.
+
+**Branch.** Stay on `{{BRANCH}}`. Never push, merge, rebase, switch branches or rewrite
+existing commits.
+
+**Commits.** The owner has asked, once and for the whole chain, for every completed and
+verified milestone to be committed. That standing instruction overrides any "commit only when
+asked" rule in the repo. Use the commit message convention the repo documents. Never skip hooks
+or bypass signing. If a commit fails on signing or a hook you cannot fix, leave the work staged,
+put a dated `COMMIT PENDING` note on the milestone in the plan, and report it.
+
+**Definition of done.** All of these, or it is not landed:
+1. Implemented, after re-reading the milestone's section against the current source. Fix the
+   plan if a fact in it has drifted.
+2. Builds, and its tests pass, using the commands the plan and CLAUDE.md give.
+3. Verified against the milestone's own gate, with evidence you actually observed: command
+   output, readbacks, log lines. Never mark a milestone done on reasoning alone.
+4. The plan updated: the milestone ticked, what was delivered and how it was verified, any new
+   verified facts in the section the plan keeps for them, and any autonomous decision with the
+   date and a one-line reason.
+5. Every other doc the repo says must track the change updated in the same commit.
+6. Committed.
+
+**Honest over optimistic.** If you cannot land it, leave the plan saying exactly what is done,
+what is open and what you ruled out. Commit whatever is safe to commit. A wrong "done" costs the
+next session far more than an honest "in progress".
+
+**Gates you cannot self-certify.** If a gate is a human judgement ("feels right", "looks
+good"), do the measurable half, record it, and say plainly that a human pass is required. Never
+rate your own work against a subjective bar and call it passed.
+
+**Leave the environment usable.** The next session needs the same machine. Stop the processes
+you started unless the plan expects them running, leave no modal dialog or blocking prompt
+open, and leave any app the plan's dev loop relies on in the state the plan describes.
+
+**Spend context carefully.** A long session is cut at a milestone checkpoint once it is
+{{THRESHOLD}} full. Read files in the slices you need, and hand broad searches and big readings to
+subagents so that only their conclusions enter your context.
+
+**Improve the tooling as you go.** If an instruction in CLAUDE.md, the plan or the docs misled
+you, fix it in the same commit. That is how the chain gets better instead of repeating itself.
+
+**Final message.** One short paragraph of what happened, including any autonomous decision
+and where you recorded it. Then a final line that is *exactly* one of these, which the driver
+reads:
+
+    LOOP_STATUS: LANDED <milestone>
+    LOOP_STATUS: PARTIAL <milestone> — <one-line reason>
+    LOOP_STATUS: BLOCKED — <one-line reason>
+    LOOP_STATUS: PLAN_COMPLETE
+
+Use `PLAN_COMPLETE` only when no milestone in scope is left open.
