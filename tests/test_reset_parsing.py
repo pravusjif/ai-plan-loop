@@ -37,8 +37,11 @@ class ResetTextTest(unittest.TestCase):
         self.assertEqual(epoch, (target + timedelta(days=1)).timestamp())
 
     def test_twelve_am(self):
-        epoch, _ = parse_reset_text("resets 12am")
-        self.assertEqual(datetime.fromtimestamp(epoch).hour, 0)
+        epoch, how = parse_reset_text("resets 12am")
+        if epoch is None:  # run in the 3 hours after midnight: midnight "just passed"
+            self.assertIn("just passed", how)
+        else:
+            self.assertEqual(datetime.fromtimestamp(epoch).hour, 0)
 
     def test_none(self):
         self.assertEqual(parse_reset_text("nothing here"), (None, "no reset time in the message"))

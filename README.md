@@ -68,6 +68,11 @@ name the agent that ran.
 | Instructions file named in the prompt | `CLAUDE.md` | `AGENTS.md` | `GEMINI.md or AGENTS.md` | `AGENTS.md` |
 | Verified live | yes | **not yet** | **not yet** | through the tests |
 
+What each adapter assumes about its CLI is written down at the top of that adapter's section in
+`loop_agents.py`: event formats, limit wording, exit codes, where each fact came from, and
+whether it was verified live. Update that list whenever a live run proves an assumption right or
+wrong.
+
 An agent that cannot resume or measure context still works. Every milestone gets a fresh
 session, which costs the prompt cache but nothing else.
 
@@ -289,65 +294,6 @@ which is untracked, so sessions running `git add -A` can never stage it.
 | `--max-consecutive-stalls` / `-errors` / `--max-fast-failures` | `2` / `3` / `10` | halt thresholds |
 | `--preflight` | none | shell command (cmd.exe on Windows) that must exit 0 before each turn; probed every `--preflight-probe-s` (300) up to `--preflight-max-probes` (24) times |
 | `--max-budget-usd` | none | per-turn cap, Claude only; only bites on API-key billing |
-
-## CLI facts
-
-### Claude Code (verified live, 2.1.173, 2026-10-02)
-
-- A usage-limited model gives
-  `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":<epoch>,"rateLimitType":"seven_day_overage_included",…}}`,
-  then a `result` with `subtype:"success"` (it lies), `is_error:true`, `api_error_status:429`,
-  and the text "You've hit your limit · resets 1am (Europe/Berlin)". The process exits 1 in
-  under a second and costs $0. `rate_limit_event` with `status:"allowed"` also appears on
-  healthy calls; ignore it.
-- Limits are per model: Fable was capped while Opus answered in the same minute.
-- An unknown or inaccessible model gives exit 1, `api_error_status:404`, and "There's an issue
-  with the selected model (X). It may not exist or you may not have access to it."
-- `claude -p --resume <id>` keeps the same `session_id`, and context accumulates across turns.
-  A resumed turn hits the prompt cache.
-- `result.modelUsage["claude-opus-4-8"].contextWindow` was `1000000` for `--model opus`.
-- The base context of a fresh session in the repo the tool was developed in was about 35k tokens.
-- 2026-10-05, after the agent adapters: `tests/smoke_test.py` passed with `--model sonnet`
-  (`claude-sonnet-4-6`, 200k window). The run took 2 sessions and 3 milestones, and milestone 2
-  resumed at 16.7% context. It cost $0.88 in total, about $0.19 to $0.40 per turn.
-
-### OpenAI Codex CLI (from the docs and source, 2026-10-05; not yet run live)
-
-Confirm these with `python tests/smoke_test.py --agent codex` once codex is installed, then fix
-the adapter and this section.
-
-- `codex exec --json -` reads the prompt from stdin and writes JSONL: `thread.started
-  {thread_id}`, `turn.started`, `item.started|updated|completed {item}`, `turn.completed
-  {usage}`, `turn.failed {error}`, `error {message}`. The final answer is the last
-  `agent_message` item.
-- `codex exec resume <thread_id> -` continues a session. The exec flags (`--json`, `-m`, `-c`,
-  `--sandbox`, `--dangerously-bypass-approvals-and-sandbox`) are global, so they also work before
-  `resume`.
-- `turn.completed.usage` holds thread totals, not the last call. Per-call usage and
-  `model_context_window` are only in the rollout file's `token_count` events, which also carry
-  `rate_limits.{primary,secondary}.{used_percent,resets_at}`.
-- A usage limit arrives on stdout as `error` and then `turn.failed`, worded "You've hit your
-  usage limit. … try again at Sep 22nd, 2026 9:51 AM." (or "at 5:36 PM", or "in N hours").
-- The exit code on failure is unverified. The adapter treats a turn as failed unless
-  `turn.completed` arrived.
-- `--sandbox workspace-write` may keep `.git` read-only, which would make every commit fail.
-  This is why the default is `--dangerously-bypass-approvals-and-sandbox`.
-
-### Gemini CLI (from the docs and source, 2026-10-05; not yet run live)
-
-- `-p` forces headless mode and is appended to whatever comes on stdin. `--output-format
-  stream-json` emits `init {session_id, model}`, `message {role, content, delta}`, `tool_use`,
-  `tool_result`, `error {severity, message}` and `result {status, error, stats}`.
-- Assistant text arrives in `delta` chunks, which the adapter joins.
-- `stats` holds session totals only, so context is unknown.
-- `--resume` exists, but with it the CLI ignores a prompt on stdin (gemini-cli #14180). The
-  prompt cannot safely go on the command line through a `.cmd` shim, so the adapter never
-  resumes.
-- `--approval-mode yolo` replaced `--yolo`. The adapter checks `gemini --help` and falls back to
-  `--yolo` on older versions.
-- Quota wording: "You have exhausted your daily quota on this model.", "Your quota will reset
-  after 22h54m12s.", 429 `RESOURCE_EXHAUSTED`. The CLI retries on its own first, so a limited
-  turn can take longer than `--fast-fail-s`. That is harmless because limits are checked first.
 
 ## Testing
 

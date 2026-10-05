@@ -12,6 +12,9 @@ state, checkpoints -- lives in plan_loop.py and is the same for every agent.
   gemini  Gemini CLI     `gemini --output-format stream-json -p`  from docs, not yet run live
   custom  any CLI        `--agent-cmd "tool {prompt_file}"`       plain text output
 
+What each adapter assumes about its CLI, where that comes from and whether it
+was verified live, is written down at the top of that adapter's section.
+
 Stdlib only. Imports nothing from plan_loop.py.
 """
 
@@ -532,6 +535,20 @@ class Agent:
 
 
 # --- Claude Code ---------------------------------------------------------------
+#
+# Verified live against Claude Code 2.1.173 (2026-10-02, re-checked 2026-10-05).
+# The usage-limit and unknown-model facts sit above LIMIT_EPOCH_RE and
+# MODEL_UNAVAILABLE_RE. Beyond those:
+#   * A limited model's turn exits 1 in under a second and costs $0.
+#   * Limits are per model: Fable was capped while Opus answered in the same
+#     minute, which is why the driver benches models, not the whole agent.
+#   * `claude -p --resume <id>` keeps the same session_id, context accumulates
+#     across turns, and a resumed turn hits the prompt cache.
+#   * result.modelUsage["claude-opus-4-8"].contextWindow was 1000000 for
+#     `--model opus`; claude-sonnet-4-6 reported 200000.
+#   * A fresh session starts at roughly 33-35k tokens of context.
+#   * tests/smoke_test.py (2026-10-05, --model sonnet): 2 sessions, 3 milestones,
+#     milestone 2 resumed at 16.7% context, $0.88 total ($0.19-0.40 per turn).
 
 class ClaudeParser(StreamParser):
     """Claude Code stream-json, verified against 2.1.173."""
@@ -666,6 +683,28 @@ class ClaudeAgent(Agent):
 
 
 # --- OpenAI Codex CLI -------------------------------------------------------------
+#
+# NOT YET RUN LIVE. Read from the docs and the codex-rs source on 2026-10-05
+# (exec/src/cli.rs, exec_events.rs, event_processor_with_jsonl_output.rs).
+# Confirm with `python tests/smoke_test.py --agent codex`, then fix the adapter
+# and this list.
+#   * `codex exec --json -` reads the prompt from stdin and writes JSONL:
+#     thread.started {thread_id}, turn.started, item.started|updated|completed
+#     {item}, turn.completed {usage}, turn.failed {error}, error {message}. The
+#     final answer is the last agent_message item.
+#   * `codex exec resume <thread_id> -` continues a session. The exec flags
+#     (--json, -m, -c, --sandbox, --dangerously-bypass-approvals-and-sandbox)
+#     are global, so they also work before `resume`.
+#   * turn.completed.usage holds thread totals, not the last call. Per-call
+#     usage and model_context_window are only in the rollout file's token_count
+#     events, which also carry rate_limits.{primary,secondary}.{used_percent,
+#     resets_at}: see read_codex_rollout.
+#   * A usage limit arrives on stdout as `error` then `turn.failed`; the
+#     wording is above TRY_AGAIN_AT_RE.
+#   * The exit code on failure is unknown, so a turn counts as failed unless
+#     turn.completed arrived.
+#   * `--sandbox workspace-write` may keep .git read-only, so every commit
+#     would fail: the default is --dangerously-bypass-approvals-and-sandbox.
 
 class CodexParser(StreamParser):
     """`codex exec --json` JSONL: thread.started, turn.started, item.*,
@@ -863,6 +902,25 @@ def _codex_reset(limits: dict) -> float | None:
 
 
 # --- Gemini CLI -----------------------------------------------------------------
+#
+# NOT YET RUN LIVE. Read from the gemini-cli docs (headless.md, cli-reference.md,
+# session-management.md) and packages/core/src/output/types.ts on 2026-10-05.
+# Confirm with `python tests/smoke_test.py --agent gemini`, then fix the adapter
+# and this list.
+#   * `-p` forces headless mode and is appended to whatever comes on stdin.
+#     `--output-format stream-json` emits init {session_id, model}, message
+#     {role, content, delta}, tool_use, tool_result, error {severity, message}
+#     and result {status, error, stats}.
+#   * Assistant text arrives in delta chunks, which GeminiParser joins.
+#   * stats holds session totals only, so context is unknown.
+#   * `--resume` exists, but with it the CLI ignores a prompt on stdin
+#     (gemini-cli #14180), and the prompt cannot safely go on the command line
+#     through a .cmd shim, so this adapter never resumes.
+#   * `--approval-mode yolo` replaced `--yolo`; GeminiAgent.prepare checks
+#     `gemini --help` and falls back on older versions.
+#   * The quota wording is above GEMINI_QUOTA_RE. The CLI retries on its own
+#     first, so a limited turn can outlast --fast-fail-s; harmless, because
+#     the driver checks for a limit before it checks for a fast failure.
 
 GEMINI_PROMPT_TAIL = "Follow the instructions above."
 
