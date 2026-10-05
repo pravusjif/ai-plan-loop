@@ -1,13 +1,14 @@
-We are working through the plan in {{PLAN_REF}}, unattended, on branch `{{BRANCH}}`.
-Read {{INSTRUCTIONS_FILES}} (if the repo has one) and {{PLAN_REF}} in full before touching anything. The plan
+--- first prompt (stdin) ---
+We are working through the plan in @docs/PLAN.md, unattended, on branch `main`.
+Read CLAUDE.md (if the repo has one) and @docs/PLAN.md in full before touching anything. The plan
 says what to build, in what order, and how a milestone is verified and recorded. Where the plan
 or the repo's own instructions are more specific than this prompt, follow them.
 
 Implement the next milestone (or task) in the plan that is not done yet, verify it, record it in
-the plan, and commit it. {{NEXT_HINT}} {{SCOPE}}
+the plan, and commit it. By the plan's checklist the next open item is `2. Scripts. Write the scripts.`. Confirm that against the plan's own ordering and dependencies. 
 
 Any design question that would normally go to the user, you decide autonomously, the way the
-plan's existing decisions point. Record each such decision in {{PLAN}}.
+plan's existing decisions point. Record each such decision in docs/PLAN.md.
 
 ---
 
@@ -15,12 +16,12 @@ plan's existing decisions point. Record each such decision in {{PLAN}}.
 
 You are one link in an unattended chain. A driver script (`plan_loop.py`)
 started this session and will start others after it. Nothing carries between sessions except
-what is on disk, so `{{PLAN}}` is not documentation of your work: it *is* the handoff. A
+what is on disk, so `docs/PLAN.md` is not documentation of your work: it *is* the handoff. A
 milestone you land but do not write up is a milestone the next session redoes.
 
 **One milestone per turn.** Do exactly one milestone, then end your turn with the
 `LOOP_STATUS` line below. Do not start a second one in the same turn, even if the first went
-quickly. After your turn the driver measures this session's context: under {{THRESHOLD}} it sends
+quickly. After your turn the driver measures this session's context: under 30% it sends
 you the next milestone in this same session, otherwise it ends the session and a fresh one
 continues. That is the driver's decision, not yours.
 
@@ -34,7 +35,7 @@ names. Do not silently substitute a different one: if it is genuinely blocked (i
 a missing tool, a decision only the owner can make), mark it blocked in the plan naming the
 blocker, take the next unblocked one, and name the swap in your `LOOP_STATUS` line.
 
-**Branch.** Stay on `{{BRANCH}}`. Never push, merge, rebase, switch branches or rewrite
+**Branch.** Stay on `main`. Never push, merge, rebase, switch branches or rewrite
 existing commits.
 
 **Commits.** The owner has asked, once and for the whole chain, for every completed and
@@ -46,7 +47,7 @@ put a dated `COMMIT PENDING` note on the milestone in the plan, and report it.
 **Definition of done.** All of these, or it is not landed:
 1. Implemented, after re-reading the milestone's section against the current source. Fix the
    plan if a fact in it has drifted.
-2. Builds, and its tests pass, using the commands the plan and {{INSTRUCTIONS_FILES}} give.
+2. Builds, and its tests pass, using the commands the plan and CLAUDE.md give.
 3. Verified against the milestone's own gate, with evidence you actually observed: command
    output, readbacks, log lines. Never mark a milestone done on reasoning alone.
 4. The plan updated: the milestone ticked, what was delivered and how it was verified, any new
@@ -68,9 +69,10 @@ you started unless the plan expects them running, leave no modal dialog or block
 open, and leave any app the plan's dev loop relies on in the state the plan describes.
 
 **Spend context carefully.** A long session is cut at a milestone checkpoint once it is
-{{THRESHOLD}} full. Read files in the slices you need, {{DELEGATE_HINT}}.
+30% full. Read files in the slices you need, and hand broad searches and big readings to
+subagents so that only their conclusions enter your context.
 
-**Improve the tooling as you go.** If an instruction in {{INSTRUCTIONS_FILES}}, the plan or the docs misled
+**Improve the tooling as you go.** If an instruction in CLAUDE.md, the plan or the docs misled
 you, fix it in the same commit. That is how the chain gets better instead of repeating itself.
 
 **Final message.** One short paragraph of what happened, including any autonomous decision
@@ -83,3 +85,17 @@ reads:
     LOOP_STATUS: PLAN_COMPLETE
 
 Use `PLAN_COMPLETE` only when no milestone in scope is left open.
+
+
+--- continue prompt (stdin), shown at 12% context ---
+Milestone checkpoint passed. This session's context is 12.0% full, under the
+30% rotation threshold, so the driver has kept you in the same session for the next
+milestone.
+
+Re-read the milestone list and status in docs/PLAN.md: it changed during your last turn, so use the
+file, not your memory of it. Confirm with `git status` that the tree is clean, then take the
+next milestone that is not done. By the plan's checklist the next open item is `2. Scripts. Write the scripts.`. Confirm that against the plan's own ordering and dependencies. 
+
+Same loop protocol as before: exactly one milestone this turn, the same definition of done,
+commit it, and end with the `LOOP_STATUS` line.
+

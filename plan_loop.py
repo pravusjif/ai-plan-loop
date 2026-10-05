@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """
-plan_loop.py -- the AI Plan Loop: an unattended chain of Claude Code sessions that
-works through a markdown plan one milestone at a time until the plan is done.
+plan_loop.py -- the AI Plan Loop: an unattended chain of coding-agent sessions
+(Claude Code, Codex CLI, Gemini CLI, or any CLI) that works through a markdown
+plan one milestone at a time until the plan is done.
 
     python tools/ai_plan_loop/plan_loop.py docs/PLAN.md --dry-run
     python tools/ai_plan_loop/plan_loop.py docs/PLAN.md --max-milestones 1
     python tools/ai_plan_loop/plan_loop.py docs/PLAN.md
     python tools/ai_plan_loop/plan_loop.py docs/PLAN.md --until "6. Build"
+    python tools/ai_plan_loop/plan_loop.py docs/PLAN.md --agent codex
+    python tools/ai_plan_loop/plan_loop.py docs/PLAN.md --agent-cmd "mytool run {prompt_file}"
 
     create .ai-loop/<plan>/STOP   # stop cleanly after the current milestone
     Ctrl-C                        # stop now (the running session is killed)
 
 The rules (README.md has the reasoning):
 
-  * Model: Fable, rotating to Opus while Fable is unavailable or usage-limited.
-    Effort: high.
+  * Agent: --agent, else $AI_PLAN_LOOP_AGENT, else auto: claude if it is on PATH,
+    otherwise the one other supported CLI found. loop_agents.py has the adapters.
+  * Model (Claude): Fable, rotating to Opus while Fable is unavailable or
+    usage-limited. Effort: high. Other agents default to their CLI's own model.
   * One milestone per TURN. A turn ends with a `LOOP_STATUS:` line. After a turn
     that lands a milestone the driver measures the session's context. Under the
     threshold (30%), it resumes the SAME session (`claude -p --resume <id>`) for
-    the next milestone. At or over the threshold, the session ends and the next
-    milestone gets a fresh session.
+    the next milestone. At or over the threshold, or when the agent cannot report
+    context or resume, the next milestone gets a fresh session.
   * Usage limit: the model is benched until the reset time the server reported
     (the exact `resetsAt` epoch from the stream, else the "resets 1am" text), and
     the other model takes over. With every model limited, the driver sleeps until
@@ -27,8 +32,8 @@ The rules (README.md has the reasoning):
   * Progress is judged by the repo, not by what the session says: a commit, or a
     checkbox ticked in the plan. Two turns in a row without either halt the chain.
 
-Each turn is a separate `claude -p` process. Nothing carries between sessions
-except what is on disk: the plan, the code and the git history.
+Each turn is a separate agent process. Nothing carries between sessions except
+what is on disk: the plan, the code and the git history.
 
 Stdlib only. Verified against Claude Code 2.1.173.
 """
@@ -40,70 +45,30 @@ import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from loop_agents import (  # noqa: E402
+    ALL_PARENT_VARS, IS_WINDOWS, Agent, TurnResult, TurnSpec, fmt_dur, now,
+    resolve_options, select_agent, split_command, unsafe_cmd_args,
+)
+
 DEFAULT_PROMPT = HERE / "prompt.md"
 DEFAULT_CONTINUE = HERE / "continue.md"
-IS_WINDOWS = os.name == "nt"
-
-# The last line of every turn. The driver reads it, but never trusts it alone.
-STATUS_RE = re.compile(r"^\s*LOOP_STATUS:\s*(.+?)\s*$", re.MULTILINE)
 
 # Default ledger: top-level markdown checkboxes ("- [ ] **2. Scripts.** ...").
 # Indented sub-checkboxes are ignored so a milestone's own task list does not
 # count as separate milestones.
 DEFAULT_OPEN_RE = r"^[-*+] \[ \] (.+)$"
 DEFAULT_DONE_RE = r"^[-*+] \[[xX]\] (.+)$"
-
-# --- usage limits ------------------------------------------------------------
-# Primary signal, verified live 2026-10-02: a capped model makes the stream carry
-#   {"type":"rate_limit_event","rate_limit_info":{"status":"rejected",
-#    "resetsAt":1790982000,"rateLimitType":"seven_day_overage_included",...}}
-# followed by a `result` with subtype="success" (it lies), is_error=true,
-# api_error_status=429 and the text "You've hit your limit · resets 1am
-# (Europe/Berlin)". The same event with status="allowed" is just bookkeeping.
-# The regexes below are the fallback for paths that do not emit the event.
-LIMIT_EPOCH_RE = re.compile(r"usage limit reached\|(\d{10,13})", re.IGNORECASE)
-# Keep the qualifier slot permissive: "hit your limit", "hit your session limit",
-# "hit your weekly limit" have all been seen.
-LIMIT_TEXT_RE = re.compile(
-    r"hit your (?:\w+ ){0,3}limit|(?:usage|session|weekly|daily) limit|"
-    r"limit reached|rate[_ ]limit|too many requests|\b429\b|"
-    r"limit will reset|resets? (?:at )?\d{1,2}\s*[:.]?\d{0,2}\s*[ap]m|"
-    r"out of (?:usage|credits)",
-    re.IGNORECASE,
-)
-RESET_TIME_RE = re.compile(
-    r"reset(?:s)?(?:\s+at)?\s+(\d{1,2})(?:[:.](\d{2}))?\s*([ap]m)?"
-    r"(?:\s*\(([^)]{2,40})\))?",
-    re.IGNORECASE,
-)
-OVERLOAD_RE = re.compile(r"overloaded|\b529\b|service unavailable|\b503\b", re.IGNORECASE)
-# Verified live 2026-10-02 with `--model claude-bogus-9`: exit 1, api_error_status
-# 404, "There's an issue with the selected model (claude-bogus-9). It may not
-# exist or you may not have access to it."
-MODEL_UNAVAILABLE_RE = re.compile(
-    r"issue with the selected model|may not exist or you may not have access|"
-    r"invalid model|not_found_error",
-    re.IGNORECASE,
-)
-
-
-PARENT_SESSION_VARS = {
-    "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_AGENT_SDK_VERSION",
-    "MCP_CONNECTION_NONBLOCKING", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_CODE_ENABLE_TASKS", "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
-    "CLAUDE_CODE_EMIT_STARTUP_TIMING", "CLAUDE_CODE_SSE_PORT",
-}
 
 
 class Halt(Exception):
@@ -112,22 +77,12 @@ class Halt(Exception):
 
 # ------------------------------------------------------------------ plumbing
 
-def now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 def stamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def fmt_epoch(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
-
-
-def fmt_dur(seconds: float) -> str:
-    seconds = int(max(0, seconds))
-    h, rem = divmod(seconds, 3600)
-    return f"{h}h {rem // 60:02d}m" if h else f"{rem // 60}m {rem % 60:02d}s"
 
 
 class Log:
@@ -256,45 +211,6 @@ class Ledger:
 
 # ---------------------------------------------------------------- turn runner
 
-class TurnResult:
-    def __init__(self) -> None:
-        self.exit_code = -1
-        self.is_error = True
-        self.subtype = "unknown"
-        self.api_error_status = None
-        self.result_text = ""
-        self.stderr = ""
-        self.cost_usd = 0.0
-        self.num_turns = 0
-        self.duration_s = 0.0
-        self.session_id = ""
-        self.model_name = ""
-        self.timed_out = False
-        self.rate_limit_rejected: dict | None = None
-        self.ctx_tokens: int | None = None
-        self.ctx_window: int | None = None
-        self.model_usage: dict = {}
-
-    @property
-    def failed(self) -> bool:
-        return self.timed_out or self.is_error or self.exit_code != 0
-
-    @property
-    def loop_status(self) -> str:
-        found = STATUS_RE.findall(self.result_text or "")
-        return found[-1].strip() if found else ""
-
-    @property
-    def haystack(self) -> str:
-        return f"{self.stderr}\n{self.result_text}"
-
-    def ctx_pct(self, fallback_window: int) -> float | None:
-        if self.ctx_tokens is None:
-            return None
-        window = self.ctx_window or fallback_window
-        return self.ctx_tokens / window if window else None
-
-
 def _pump(stream, sink: "queue.Queue", tag: str) -> None:
     try:
         for line in stream:
@@ -305,105 +221,17 @@ def _pump(stream, sink: "queue.Queue", tag: str) -> None:
         sink.put((tag, None))
 
 
-def _tool_hint(tool_input: dict) -> str:
-    for key in ("command", "file_path", "pattern", "skill", "description", "prompt", "url"):
-        val = tool_input.get(key)
-        if isinstance(val, str) and val.strip():
-            return f"({' '.join(val.split())[:110]})"
-    return ""
-
-
-def _render(line: str, res: TurnResult, log: Log) -> None:
-    """Turn one stream-json line into a readable log line, and harvest facts."""
-    line = line.strip()
-    if not line:
-        return
-    try:
-        ev = json.loads(line)
-    except json.JSONDecodeError:
-        log(f"[raw] {line[:400]}")
-        return
-    kind = ev.get("type")
-
-    if kind == "system" and ev.get("subtype") == "init":
-        res.session_id = ev.get("session_id", "") or res.session_id
-        res.model_name = ev.get("model", "")
-        log(f"[{now()}] session_id={res.session_id} model={res.model_name}")
-
-    elif kind == "rate_limit_event":
-        info = ev.get("rate_limit_info") or {}
-        if info.get("status") == "rejected":
-            res.rate_limit_rejected = info
-            log(f"[{now()}] rate limit REJECTED: type={info.get('rateLimitType')} "
-                f"resetsAt={info.get('resetsAt')}")
-
-    elif kind == "assistant":
-        sub = ev.get("parent_tool_use_id") is not None
-        msg = ev.get("message") or {}
-        # Context = what the model saw on its latest call. Subagents run in their
-        # own context, so only top-level messages count.
-        usage = msg.get("usage") or {}
-        if not sub and usage:
-            seen = sum(int(usage.get(k) or 0) for k in (
-                "input_tokens", "cache_creation_input_tokens",
-                "cache_read_input_tokens", "output_tokens"))
-            if seen > 0:
-                res.ctx_tokens = seen
-        pad = "    [sub] " if sub else ""
-        for block in msg.get("content") or []:
-            btype = block.get("type")
-            if btype == "text" and not sub:
-                text = (block.get("text") or "").strip()
-                if text:
-                    log(text)
-            elif btype == "tool_use":
-                log(f"  {pad}-> {block.get('name', '?')}{_tool_hint(block.get('input') or {})}")
-            elif btype == "thinking" and not sub:
-                log("  -> (thinking)")
-
-    elif kind == "result":
-        res.subtype = ev.get("subtype", "unknown")
-        res.is_error = bool(ev.get("is_error", True))
-        res.api_error_status = ev.get("api_error_status")
-        res.result_text = ev.get("result") or ""
-        res.cost_usd = float(ev.get("total_cost_usd") or 0.0)
-        res.num_turns = int(ev.get("num_turns") or 0)
-        res.session_id = ev.get("session_id", "") or res.session_id
-        res.model_usage = ev.get("modelUsage") or {}
-        res.ctx_window = _context_window(res.model_usage, res.model_name)
-        log("")
-        log(f"[{now()}] --- result: subtype={res.subtype} is_error={res.is_error} "
-            f"api_error_status={res.api_error_status} turns={res.num_turns} "
-            f"cost=${res.cost_usd:.2f}")
-        if res.result_text and res.is_error:  # on success it repeats the last text block
-            log(res.result_text)
-
-
-def _context_window(model_usage: dict, model_name: str) -> int | None:
-    """The session model's window from the result's modelUsage (1000000 for
-    Opus here). Prefer the entry for the init model; subagents and helper
-    models get their own entries."""
-    if not model_usage:
-        return None
-    entry = model_usage.get(model_name)
-    if entry is None:
-        entry = max(model_usage.values(),
-                    key=lambda e: int(e.get("inputTokens") or 0)
-                    + int(e.get("cacheReadInputTokens") or 0)
-                    + int(e.get("cacheCreationInputTokens") or 0))
-    window = entry.get("contextWindow")
-    return int(window) if window else None
-
-
 # ---------------------------------------------------------------- the driver
 
 class Driver:
-    def __init__(self, cfg: argparse.Namespace, repo: Path, plan: Path, claude: str):
+    def __init__(self, cfg: argparse.Namespace, repo: Path, plan: Path, agent: Agent,
+                 exe: list[str]):
         self.cfg = cfg
         self.repo = repo
         self.plan = plan
         self.plan_rel = os.path.relpath(plan, repo).replace("\\", "/")
-        self.claude = claude
+        self.agent = agent
+        self.exe = exe
         slug = re.sub(r"[^A-Za-z0-9]+", "-", self.plan_rel).strip("-")
         self.loop_root = repo / ".ai-loop"
         self.state_dir = self.loop_root / slug
@@ -494,6 +322,9 @@ class Driver:
         scope = (f"Stop after the item matching `{self.cfg.until}`: report PLAN_COMPLETE "
                  "once it is done." if self.cfg.until else "")
         return (template
+                .replace("{{PLAN_REF}}", self.agent.plan_ref(self.plan_rel))
+                .replace("{{INSTRUCTIONS_FILES}}", self.agent.instruction_files)
+                .replace("{{DELEGATE_HINT}}", self.agent.delegate_hint)
                 .replace("{{PLAN}}", self.plan_rel)
                 .replace("{{BRANCH}}", self.branch)
                 .replace("{{NEXT_HINT}}", hint)
@@ -510,54 +341,57 @@ class Driver:
     def continue_prompt(self, ctx_pct: float | None) -> str:
         return self.render(Path(self.cfg.continue_file).read_text(encoding="utf-8"), ctx_pct)
 
-    # --- one claude -p process ------------------------------------------------
+    # --- one agent process ----------------------------------------------------
 
-    def argv(self, model: str, resume_id: str | None, name: str) -> list[str]:
-        cfg = self.cfg
-        argv = [self.claude, "-p", "--model", model, "--effort", cfg.effort,
-                "--permission-mode", cfg.permission_mode,
-                "--output-format", "stream-json", "--verbose"]
-        if resume_id:
-            argv += ["--resume", resume_id]
-        else:
-            argv += ["--name", name]
-        # The CLI fallback only covers overload inside a call; usage limits are
-        # per model and long-lived, so the driver rotates for those itself.
+    def argv(self, model: str, resume_id: str | None, name: str,
+             prompt_file: str = "<prompt-file>") -> list[str]:
+        # The fallback goes to the CLI for overload inside a call (Claude only);
+        # usage limits are per model and long-lived, so the driver rotates for
+        # those itself.
         others = [m for m in self.chain if m != model and m not in self.unavailable
                   and float(self.limited_until().get(m, 0)) <= time.time()]
-        if others:
-            argv += ["--fallback-model", others[0]]
-        if cfg.permission_mode == "bypassPermissions":
-            argv += ["--allow-dangerously-skip-permissions"]
-        if cfg.max_budget_usd:
-            argv += ["--max-budget-usd", str(cfg.max_budget_usd)]
-        return argv
+        spec = TurnSpec(model=model, resume_id=resume_id, name=name,
+                        fallback=others[0] if others else None, prompt_file=prompt_file,
+                        plan=self.plan_rel, repo=str(self.repo))
+        return self.agent.argv(self.exe, self.cfg, spec)
 
     def run_turn(self, model: str, prompt: str, resume_id: str | None, name: str,
                  raw_path: Path, log: Log) -> TurnResult:
-        argv = self.argv(model, resume_id, name)
+        prompt_path = raw_path.with_name(f"{raw_path.stem}-{stamp()}.prompt.md")
+        argv = self.argv(model, resume_id, name, str(prompt_path))
+        unsafe = unsafe_cmd_args(argv)
+        if unsafe:
+            raise Halt(f"{argv[0]} is a .cmd/.bat shim and cmd.exe would mangle these "
+                       f"arguments: {unsafe}")
+        payload = self.agent.stdin_payload(prompt)
+        if payload is None:
+            prompt_path.write_text(prompt, encoding="utf-8")
         log(f"[{now()}] $ {' '.join(argv)}")
-        log(f"[{now()}] (prompt on stdin, {len(prompt)} chars)")
+        log(f"[{now()}] (prompt on stdin, {len(prompt)} chars)" if payload is not None
+            else f"[{now()}] (prompt in {prompt_path}, {len(prompt)} chars)")
         res = TurnResult()
         res.session_id = resume_id or ""
+        parser = self.agent.new_parser(prompt)
         started = time.monotonic()
-        # Started from inside a Claude Code session, the driver would hand that
-        # session's identity (id, messaging socket, child-session flags) to every
-        # session it spawns. Drop it so a launch from an IDE terminal or an agent
-        # behaves exactly like one from a plain shell. User settings such as
-        # CLAUDE_CONFIG_DIR or CLAUDE_CODE_GIT_BASH_PATH pass through.
-        env = {k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}
+        # Started from inside an agent session (Claude Code, Codex, Gemini), the
+        # driver would hand that session's identity (id, messaging socket, sandbox
+        # flags) to every session it spawns. Drop it so a launch from an IDE
+        # terminal or an agent behaves exactly like one from a plain shell. User
+        # settings such as CLAUDE_CONFIG_DIR or CODEX_HOME pass through.
+        env = {k: v for k, v in os.environ.items() if k not in ALL_PARENT_VARS}
         env.update(PYTHONIOENCODING="utf-8", AI_PLAN_LOOP="1", AI_PLAN_LOOP_PLAN=self.plan_rel)
         proc = subprocess.Popen(argv, cwd=str(self.repo), env=env,
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
                                 errors="replace", bufsize=1)
         try:
-            try:
-                proc.stdin.write(prompt)
-                proc.stdin.close()
-            except Exception as exc:
-                log(f"[{now()}] could not write prompt to stdin: {exc}")
+            if payload is not None:
+                try:
+                    proc.stdin.write(payload)
+                    proc.stdin.close()
+                except Exception as exc:
+                    log(f"[{now()}] could not write prompt to stdin: {exc}")
 
             q: "queue.Queue" = queue.Queue()
             for stream, tag in ((proc.stdout, "out"), (proc.stderr, "err")):
@@ -584,7 +418,7 @@ class Driver:
                         log(f"[stderr] {line}")
                     else:
                         raw.write(line + "\n")
-                        _render(line, res, log)
+                        parser.feed(line, res, log)
             res.stderr = "\n".join(stderr_lines)
             try:
                 res.exit_code = proc.wait(timeout=30)
@@ -593,6 +427,8 @@ class Driver:
                 res.exit_code = proc.returncode if proc.returncode is not None else -9
         finally:
             kill_tree(proc)  # no-op unless Ctrl-C or an error got us here
+        parser.finish(res, log)
+        self.agent.after_turn(res, self.repo, log)
         res.duration_s = time.monotonic() - started
         return res
 
@@ -602,25 +438,12 @@ class Driver:
         """(usage limit?, seconds to bench the model, how that was decided)."""
         if not res.failed:
             return False, 0.0, ""
-        cfg = self.cfg
-        info = res.rate_limit_rejected
-        if info is None:
-            if res.api_error_status != 429 and not LIMIT_TEXT_RE.search(res.haystack):
-                return False, 0.0, ""
-            m = LIMIT_EPOCH_RE.search(res.haystack)
-            if m:
-                epoch = int(m.group(1))
-                epoch = epoch // 1000 if epoch > 10**12 else epoch
-                return (True, *self._until(epoch, "reset epoch in the message"))
-            epoch, how = parse_reset_text(res.haystack)
-            if epoch is not None:
-                return (True, *self._until(epoch, f"reset time read as {how}"))
-            return True, float(cfg.limit_probe_s), f"{how} -- probing every {fmt_dur(cfg.limit_probe_s)}"
-        resets = info.get("resetsAt")
-        kind = info.get("rateLimitType", "?")
-        if resets:
-            return (True, *self._until(float(resets), f"server reset time ({kind})"))
-        return True, float(cfg.limit_probe_s), f"no reset time ({kind}) -- probing"
+        signal = self.agent.limit_signal(res, self.cfg.limit_probe_s)
+        if signal is None:
+            return False, 0.0, ""
+        if signal.epoch is not None:
+            return (True, *self._until(signal.epoch, signal.how))
+        return True, float(self.cfg.limit_probe_s), signal.how
 
     def _until(self, epoch: float, how: str) -> tuple[float, str]:
         """Bench until just after the reset, but re-probe at least every
@@ -740,8 +563,9 @@ class Driver:
         banner(log, f"session #{index} -- {now()}")
         log(f"branch      {self.branch}")
         log(f"HEAD        {self.head()[:12]}")
-        log(f"model       {model} (effort {cfg.effort})")
-        log(f"open        {' | '.join(self.ledger.open_labels()) or '(untracked plan)'}")
+        log(f"agent       {self.agent.name}")
+        log(f"model       {model} (effort {cfg.effort or 'agent default'})")
+        log(f"open      {' | '.join(self.ledger.open_labels()) or '(untracked plan)'}")
         if dirty:
             log(f"NOTE: working tree already dirty ({len(dirty.splitlines())} paths) -- "
                 "the session is told to inspect it")
@@ -803,8 +627,7 @@ class Driver:
                              and res.duration_s < cfg.fast_fail_s)
 
                 # 2. The model itself is not available on this account.
-                if died_fast and (res.api_error_status == 404
-                                  or MODEL_UNAVAILABLE_RE.search(res.haystack)):
+                if died_fast and self.agent.model_unavailable(res):
                     self.unavailable.add(model)
                     self.log(f"[{now()}] model '{model}' is not available "
                              f"({' '.join(res.haystack.split())[:160]}) -- dropped for this run")
@@ -834,7 +657,7 @@ class Driver:
                 if res.failed:
                     state["consecutive_errors"] += 1
                     self._history(index, turn, model, res, status, committed, landed, pct, "error")
-                    if OVERLOAD_RE.search(res.haystack):
+                    if self.agent.overloaded(res):
                         return "overload"
                     self.log(f"[{now()}] session #{index} turn {turn} FAILED (exit="
                              f"{res.exit_code} subtype={res.subtype} timed_out={res.timed_out}) "
@@ -900,7 +723,9 @@ class Driver:
 
                 # 8. Checkpoint: the context rule.
                 limit = self.threshold()
-                if pct is None:
+                if not self.agent.supports_resume:
+                    decision = f"{self.agent.name} cannot resume a session -> fresh session"
+                elif pct is None:
                     decision = "context unknown -> fresh session"
                 elif pct >= limit:
                     decision = f"context {pct:.1%} >= {limit:.0%} -> fresh session"
@@ -944,7 +769,8 @@ class Driver:
     def _history(self, index, turn, model, res: TurnResult, status, committed, landed,
                  pct, decision) -> None:
         self.state["history"].append({
-            "session": index, "turn": turn, "at": now(), "model": model,
+            "session": index, "turn": turn, "at": now(), "agent": self.agent.name,
+            "model": model,
             "model_id": res.model_name, "session_id": res.session_id,
             "exit_code": res.exit_code, "loop_status": status, "committed": committed,
             "ticked": landed, "head": self.head()[:12],
@@ -959,48 +785,24 @@ class StopRequested(Exception):
     pass
 
 
-def parse_reset_text(text: str) -> tuple[float | None, str]:
-    """'resets 1am (Europe/Berlin)' -> an absolute epoch.
-
-    Windows Python ships no IANA database (`pip install tzdata` fixes that), so
-    a named zone may fall back to local time, and the log says so. If the time
-    has just passed and the model is still limited, that is clock or zone skew,
-    not a reset 24 hours away: return None so the caller probes instead.
-    """
-    m = RESET_TIME_RE.search(text or "")
-    if not m:
-        return None, "no reset time in the message"
-    hour, minute = int(m.group(1)), int(m.group(2) or 0)
-    ampm = (m.group(3) or "").lower()
-    tzname = (m.group(4) or "").strip()
-    if ampm == "pm" and hour != 12:
-        hour += 12
-    elif ampm == "am" and hour == 12:
-        hour = 0
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None, f"implausible reset time {m.group(0)!r}"
-    tz, how = None, "local time (no zone given)"
-    if tzname:
-        try:
-            from zoneinfo import ZoneInfo
-            tz, how = ZoneInfo(tzname), tzname
-        except Exception:
-            how = f"local time ({tzname} unknown here; pip install tzdata)"
-    ref = datetime.now(tz) if tz else datetime.now().astimezone()
-    target = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= ref:
-        if ref - target < timedelta(hours=3):
-            return None, f"reset time {m.group(0)!r} just passed ({how})"
-        target += timedelta(days=1)
-    return target.timestamp(), how
-
-
 # ----------------------------------------------------------------------- main
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("plan", help="the plan to work through, e.g. docs/PLAN.md")
+    g = p.add_argument_group("agent")
+    g.add_argument("--agent", default=None,
+                   help="auto (default), claude, codex, gemini or custom; also "
+                        "$AI_PLAN_LOOP_AGENT. auto = claude if on PATH, else the one "
+                        "other supported CLI found")
+    g.add_argument("--agent-bin", default=None, metavar="CMD",
+                   help="the command that starts the agent, when it is not the plain "
+                        "binary on PATH (e.g. a full path, or 'npx @openai/codex')")
+    g.add_argument("--agent-cmd", default=None, metavar="TEMPLATE",
+                   help="run any CLI: a command template with {prompt_file}, {model}, "
+                        "{effort}, {plan}, {repo}, {name}; without {prompt_file} the "
+                        "prompt goes on stdin. Implies --agent custom")
     g = p.add_argument_group("scope")
     g.add_argument("--until", default="",
                    help="stop once the checklist item whose label contains this text is done")
@@ -1010,23 +812,30 @@ def parse_args() -> argparse.Namespace:
                    help="stop after this many sessions in THIS run (0 = no limit)")
     g.add_argument("--branch", default="",
                    help="required branch (default: the branch checked out at start)")
+    # Defaults of None are filled per agent by loop_agents.resolve_options.
     g = p.add_argument_group("model")
-    g.add_argument("--model", default="fable")
-    g.add_argument("--fallback-model", default="opus",
-                   help="used while the primary is limited or unavailable ('' disables)")
-    g.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
-    g.add_argument("--permission-mode", default="bypassPermissions",
-                   choices=["acceptEdits", "auto", "bypassPermissions", "default",
-                            "dontAsk", "plan"])
+    g.add_argument("--model", default=None,
+                   help="claude: fable; others: the CLI's own default")
+    g.add_argument("--fallback-model", default=None,
+                   help="used while the primary is limited or unavailable ('' disables; "
+                        "claude: opus, others: none)")
+    g.add_argument("--effort", default=None,
+                   help="claude: low|medium|high|xhigh|max (default high); codex: "
+                        "minimal|low|medium|high|xhigh (default: codex config)")
+    g.add_argument("--permission-mode", default=None,
+                   help="claude: acceptEdits|auto|bypassPermissions|default|dontAsk|plan "
+                        "(default bypassPermissions); codex: bypass|workspace-write "
+                        "(default bypass); gemini: yolo|auto_edit (default yolo)")
     g.add_argument("--max-budget-usd", type=float, default=0.0,
-                   help="per-turn cap; only bites on API-key billing")
+                   help="per-turn cap (claude only); only bites on API-key billing")
     g = p.add_argument_group("context rotation")
     g.add_argument("--context-threshold", type=float, default=0.30,
                    help="at a milestone checkpoint, a session this full or fuller is ended "
                         "and the next milestone gets a fresh one (0.30 or 30; 1 and up "
                         "are percentages)")
-    g.add_argument("--context-window", type=int, default=200_000,
-                   help="window assumed when the stream does not report one")
+    g.add_argument("--context-window", type=int, default=None,
+                   help="window assumed when the stream does not report one "
+                        "(claude 200000, codex 272000, gemini 1000000)")
     g.add_argument("--max-turns-per-session", type=int, default=0,
                    help="also rotate after this many milestones in one session (0 = off)")
     g = p.add_argument_group("prompts")
@@ -1060,15 +869,15 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--preflight-max-probes", type=int, default=24)
     p.add_argument("--dry-run", action="store_true",
                    help="print the parse, the command and the prompt; run nothing")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    cfg = parse_args()
+    cfg = parse_args(argv)
 
     plan = Path(cfg.plan).resolve()
     if not plan.is_file():
@@ -1083,12 +892,36 @@ def main() -> int:
         if not Path(f).is_file():
             print(f"FATAL: prompt file missing: {f}")
             return 2
-    claude = shutil.which("claude")
-    if not claude:
-        print("FATAL: `claude` is not on PATH")
+    agent, chosen = select_agent(cfg.agent, cfg.agent_cmd, cfg.agent_bin, dict(os.environ))
+    if agent is None:
+        print(f"FATAL: {chosen}")
         return 2
+    errors, warnings = resolve_options(agent, cfg)
+    for err in errors:
+        print(f"FATAL: {err}")
+    if errors:
+        return 2
+    exe = agent.resolve(cfg.agent_bin)
+    if exe is None:
+        wanted = cfg.agent_bin or agent.binary or "the first word of --agent-cmd"
+        if not cfg.dry_run:
+            print(f"FATAL: {wanted} not found for agent '{agent.name}' -- put it on PATH "
+                  "or pass --agent-bin")
+            return 2
+        warnings.append(f"{wanted} not found -- the dry run shows the command anyway")
+        exe = split_command(cfg.agent_bin) if cfg.agent_bin else (
+            [agent.binary] if agent.binary else [])
+        version = "not found"
+    else:
+        agent.prepare(exe)
+        version = agent.version(exe)
 
-    d = Driver(cfg, repo, plan, claude)
+    d = Driver(cfg, repo, plan, agent, exe)
+    unsafe = unsafe_cmd_args(d.argv(d.chain[0], None, "ai-plan-loop #1"))
+    if unsafe:
+        print(f"FATAL: {exe[0]} is a .cmd/.bat shim and cmd.exe would mangle these "
+              f"arguments: {unsafe}")
+        return 2
     if cfg.until and not d.ledger.until_found():
         print(f"FATAL: --until '{cfg.until}' matches no checklist item in {d.plan_rel}")
         return 2
@@ -1111,11 +944,17 @@ def main() -> int:
     log(f"repo        {repo}")
     log(f"plan        {d.plan_rel}" + (f" (until '{cfg.until}')" if cfg.until else ""))
     log(f"branch      {d.branch}")
-    log(f"models      {' -> '.join(d.chain)}, effort {cfg.effort}, "
-        f"permissions {cfg.permission_mode}")
-    log(f"rotation    fresh session at a checkpoint when context >= {d.threshold():.0%}")
-    log(f"claude      {claude}")
+    log(f"agent       {agent.name} ({' '.join(exe) or '?'}"
+        + (f", {version}" if version else "") + f"; {chosen})")
+    log(f"supports    {agent.capabilities()}"
+        + ("" if agent.verified else " -- adapter not yet verified live"))
+    log(f"models      {' -> '.join(d.chain)}, effort {cfg.effort or 'agent default'}, "
+        f"permissions {cfg.permission_mode or 'agent default'}")
+    log(f"rotation    fresh session at a checkpoint when context >= {d.threshold():.0%}"
+        + ("" if agent.supports_resume else f" (always: {agent.name} cannot resume)"))
     log(f"state       {d.state_dir}")
+    for warning in warnings:
+        log(f"WARNING     {warning}")
     items = d.ledger.items()
     open_items = [lbl for _o, lbl, done in items if not done]
     if items:
@@ -1136,13 +975,18 @@ def main() -> int:
         log(f"HEAD        {d.head()[:12]}")
         log(f"dirty       {len(d.git('status', '--porcelain').splitlines())} paths")
         log(f"command     {' '.join(d.argv(d.chain[0], None, 'ai-plan-loop #N'))}")
-        log(f"resume      {' '.join(d.argv(d.chain[0], '<session-id>', ''))}")
+        if agent.supports_resume:
+            log(f"resume      {' '.join(d.argv(d.chain[0], '<session-id>', ''))}")
+        else:
+            log(f"resume      (not supported by {agent.name}: a fresh session per milestone)")
+        via = "stdin" if agent.stdin_payload("") is not None else "file"
         log("")
-        log("--- first prompt (stdin) ---")
+        log(f"--- first prompt ({via}) ---")
         log(d.first_prompt())
-        log("")
-        log("--- continue prompt (stdin), shown at 12% context ---")
-        log(d.continue_prompt(0.12))
+        if agent.supports_resume:
+            log("")
+            log(f"--- continue prompt ({via}), shown at 12% context ---")
+            log(d.continue_prompt(0.12))
         return 0
 
     if d.halt_file.exists():

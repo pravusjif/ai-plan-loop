@@ -1,7 +1,8 @@
 # AI Plan Loop
 
-Works through a markdown plan unattended, one milestone at a time, as a chain of Claude Code
-sessions. You give it a plan on the command line. It runs until every item is done, a human is
+Works through a markdown plan unattended, one milestone at a time, as a chain of coding-agent
+sessions: Claude Code, OpenAI Codex CLI, Gemini CLI, or any CLI you describe with a command
+template. You give it a plan on the command line. It runs until every item is done, a human is
 needed, or you stop it. Usage limits are waited out on their own, and long sessions are swapped
 for fresh ones.
 
@@ -10,8 +11,10 @@ and can check the environment before each turn with an optional `--preflight` co
 
 ## Install
 
-The tool is four files and needs Python 3.9+ (stdlib only) and the `claude` CLI on `PATH`. Put
-it in the repo whose plan it should work through. The examples below assume `tools/ai_plan_loop/`:
+The tool is `plan_loop.py`, `loop_agents.py` and the two prompt files. It needs Python 3.9+
+(stdlib only) and one agent CLI: `claude`, `codex` or `gemini` on `PATH`, or any other through
+`--agent-cmd`. Put it in the repo whose plan it should work through. The examples below assume
+`tools/ai_plan_loop/`:
 
 ```powershell
 git submodule add <this repo's URL> tools/ai_plan_loop   # or copy the files there
@@ -26,6 +29,7 @@ python tools\ai_plan_loop\plan_loop.py docs\PLAN.md --dry-run           # shows 
 python tools\ai_plan_loop\plan_loop.py docs\PLAN.md --max-milestones 1  # do this first: one milestone, then stop
 python tools\ai_plan_loop\plan_loop.py docs\PLAN.md                     # until the plan is done
 python tools\ai_plan_loop\plan_loop.py docs\PLAN.md --until "6. Build"  # stop once that item is ticked
+python tools\ai_plan_loop\plan_loop.py docs\PLAN.md --agent codex      # Codex instead of Claude
 ```
 
 | To stop | Do this |
@@ -37,23 +41,73 @@ Restarting is safe and resumes from `state.json`, including model benches. Delet
 file first if the previous run halted. Only one driver can run per repo, enforced by an OS lock
 on `.ai-loop/driver.lock`, because every session shares the working tree and the git index.
 
+## Agents
+
+The driver does not care which agent does the work. Each supported CLI has an adapter in
+`loop_agents.py` that knows how to start and resume a headless turn, how to read its output,
+and how it words a usage limit or an unknown model. Everything else is the same for all of them:
+the ledger, git-based progress, checkpoints, state and halting.
+
+**Which agent runs.** `--agent claude|codex|gemini|custom`, else the `AI_PLAN_LOOP_AGENT`
+environment variable, else `auto`. Auto uses `claude` if it is on `PATH`. Otherwise it uses the
+one other supported CLI it finds, and stops with a list if it finds both or neither. The driver
+never guesses from files in the repo: `AGENTS.md` is shared by several agents, and a file says
+nothing about which agent you want to pay for. The banner and every `state.json` history entry
+name the agent that ran.
+
+| | `claude` | `codex` | `gemini` | `custom` |
+| --- | --- | --- | --- | --- |
+| Command | `claude -p --output-format stream-json` | `codex exec --json -` | `gemini --output-format stream-json -p …` | your `--agent-cmd` |
+| Prompt | stdin | stdin | stdin | stdin, or a file with `{prompt_file}` |
+| Resumes a session | yes (`--resume`) | yes (`codex exec resume <id>`) | no: fresh session per milestone | no |
+| Measures context | yes, from the stream | from the session's rollout file in `$CODEX_HOME/sessions` | no | no |
+| Cost in `state.json` | yes | no | no | no |
+| Default model | `fable`, falling back to `opus` | the CLI's own (`~/.codex/config.toml`) | the CLI's own | — |
+| `--effort` | `low` … `max` (default `high`) | `minimal` … `xhigh`, `max` = `xhigh` (default: CLI config) | ignored | passed as `{effort}` |
+| `--permission-mode` | `bypassPermissions` (default), `acceptEdits`, `auto`, `default`, `dontAsk`, `plan` | `bypass` (default), `workspace-write` | `yolo` (default), `auto_edit` | ignored |
+| Instructions file named in the prompt | `CLAUDE.md` | `AGENTS.md` | `GEMINI.md or AGENTS.md` | `AGENTS.md` |
+| Verified live | yes | **not yet** | **not yet** | through the tests |
+
+An agent that cannot resume or measure context still works. Every milestone gets a fresh
+session, which costs the prompt cache but nothing else.
+
+**Any other CLI.** `--agent-cmd` takes a command template. Its placeholders are `{prompt_file}`,
+`{model}`, `{effort}`, `{plan}`, `{repo}` and `{name}`. With `{prompt_file}` the prompt is
+written to `.ai-loop/<plan>/logs/` and the path is passed; without it, the prompt goes on stdin.
+The output is read as plain text, and `LOOP_STATUS` is taken from its last five non-empty lines.
+If the tool echoes the prompt, only what comes after the echo counts, because the prompt itself
+contains `LOOP_STATUS: PLAN_COMPLETE`.
+
+```powershell
+python plan_loop.py docs\PLAN.md --agent-cmd "aider --yes-always --message-file {prompt_file}"
+python plan_loop.py docs\PLAN.md --agent codex --agent-bin "npx -y @openai/codex"
+```
+
+`--agent-bin` starts a supported agent from somewhere other than `PATH`. On Windows, npm installs
+`codex` and `gemini` as `.cmd` shims, which `cmd.exe` re-parses. The driver never puts the prompt
+on their command line, and it refuses to start if an argument contains `" % ^ & | < >` or a
+newline.
+
 ## The rules
 
-1. **Model.** Each session uses `fable`. While Fable is usage-limited or unavailable on the
-   account, sessions use `opus`. Fable comes back as soon as its bench expires. Change the
-   models with `--model` / `--fallback-model`.
-2. **Effort.** Sessions run at `high` effort (`--effort`).
+1. **Model.** With Claude, each session uses `fable`. While Fable is usage-limited or
+   unavailable on the account, sessions use `opus`. Fable comes back as soon as its bench
+   expires. Other agents use their CLI's own default model unless you pass one. Change the models
+   with `--model` / `--fallback-model`. The fallback rotation works for every agent.
+2. **Effort.** Claude sessions run at `high` effort (`--effort`).
 3. **The plan is the only handoff.** Each session reads the plan named on the command line and
    takes the next milestone that is not done. Nothing else carries between sessions: only the
    plan, the code and the git history on disk.
-4. **One milestone per turn.** A *turn* is one `claude -p` process. It must end with a
-   `LOOP_STATUS:` line. The end of a turn that lands a milestone is a **checkpoint**.
+4. **One milestone per turn.** A *turn* is one agent process (`claude -p`, `codex exec`, …). It
+   must end with a `LOOP_STATUS:` line. The end of a turn that lands a milestone is a
+   **checkpoint**.
 5. **The context rule.** At each checkpoint the driver measures how full the session's context
    is.
    - **Under 30%:** the same session continues with the next milestone, through
-     `claude -p --resume <session-id>`. The context and prompt cache are kept.
-   - **At or over 30%:** the session ends and the next milestone starts in a **fresh**
-     session.
+     `claude -p --resume <session-id>` (or the agent's equivalent). The context and prompt cache
+     are kept.
+   - **At or over 30%,** or when the agent cannot report context or resume: the session ends and
+     the next milestone starts in a **fresh** session.
 
    The check happens only at checkpoints and never cuts a milestone in half. A turn that ends
    without closing a milestone (`PARTIAL`, `BLOCKED`, or no status) always rotates, because a
@@ -97,11 +151,11 @@ plan_loop.py docs/PLAN.md
          none?  → sleep until the earliest reset (interruptible by STOP) → loop
      --preflight (optional)
      └─ session ────────────────────────────────────────────────────────────────
-         turn 1:  claude -p --model M --effort high ...   stdin = prompt.md
-         turn k:  claude -p --resume <id> ...              stdin = continue.md
-           │ stream-json → readable log + raw .jsonl; harvest:
-           │   session_id, rate_limit_event, last top-level usage (context),
-           │   result (is_error, api_error_status, cost, modelUsage.contextWindow)
+         turn 1:  <agent> --model M ...           stdin = prompt.md     (adapter argv)
+         turn k:  <agent> --resume <id> ...       stdin = continue.md   (if it can resume)
+           │ output → readable log + raw .jsonl; the adapter harvests:
+           │   session_id, rate-limit info, context used / window,
+           │   success or error, cost, the final text with LOOP_STATUS
            ▼
          classify the turn, in this order:
            usage limit       → bench M until reset         → back to outer loop
@@ -130,14 +184,19 @@ How the pieces work:
   tokens, plus output tokens, of the last top-level assistant message in the turn. That is what
   the model saw on its final call. Subagent messages are skipped because they run in their own
   context. The window comes from `modelUsage[<model>].contextWindow` on the `result` event.
-  `--context-window` (200k) is used only if the stream ever stops reporting it. On a 1M-token
-  window, a fresh session typically starts at a few percent (system prompt, tools and
+  `--context-window` (200k for Claude) is used only if the stream ever stops reporting it. On a
+  1M-token window, a fresh session typically starts at a few percent (system prompt, tools and
   CLAUDE.md), so 30% leaves over 250k tokens of working room before rotation.
+  - Codex's `--json` stream only carries thread totals, so the adapter reads the last
+    `token_count` event (`last_token_usage`, `model_context_window`) from the session's rollout
+    file under `$CODEX_HOME/sessions`. If that file cannot be found, the context counts as
+    unknown and the next milestone gets a fresh session.
+  - Gemini's stream has no per-call usage, so every Gemini milestone gets a fresh session.
 - **Fast-failure net.** The limit regexes will always lag behind new wordings. A failure within
   `--fast-fail-s` (120 s) that commits nothing is treated as a limit or transient error the
   driver does not recognise yet. It benches the model on a growing backoff rather than spending
   the hard-error budget.
-- **Overload** inside a call is left to the CLI's own `--fallback-model`, which the driver
+- **Overload** inside a call is left to Claude's own `--fallback-model`, which the driver
   passes whenever the other model is not benched. An overload that still kills a turn gets an
   exponential backoff.
 - **Interrupted milestones.** A session cut off by a limit, a timeout or Ctrl-C leaves its work
@@ -152,8 +211,8 @@ How the pieces work:
 | `prompt.md` | first turn of every session | The task (read the plan, do the next milestone, decide design questions yourself and record them), then the loop protocol: one milestone per turn, start with `git status`, stay on the branch, never push, commit every verified milestone in the repo's convention, the six-part definition of done, honest status over optimistic, leave the environment usable, spend context carefully, and the `LOOP_STATUS` line. |
 | `continue.md` | each further turn in the same session | "Checkpoint passed at N% context: re-read the plan from disk, check the tree, take the next milestone, same protocol." |
 
-The prompts are generic. Anything specific to a repo or plan belongs in that repo's `CLAUDE.md`
-and the plan itself, which every session reads first. For instructions that only make sense
+The prompts are generic. Anything specific to a repo or plan belongs in that repo's instructions
+file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) and the plan itself, which every session reads first. For instructions that only make sense
 while running unattended, add a file with `--append-prompt-file extra.md` (repeatable). It is
 appended to the first prompt after a `---`. Use `--prompt-file` / `--continue-file` to replace a
 prompt entirely.
@@ -163,6 +222,9 @@ Placeholders, substituted at send time:
 | Placeholder | Becomes |
 | --- | --- |
 | `{{PLAN}}` | the plan's path relative to the repo |
+| `{{PLAN_REF}}` | the plan as the agent should see it: `@docs/PLAN.md` (a Claude file mention) or the bare path |
+| `{{INSTRUCTIONS_FILES}}` | the agent's instructions file: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md or AGENTS.md` |
+| `{{DELEGATE_HINT}}` | how to keep big reads out of context: hand them to subagents (Claude), or keep searches narrow |
 | `{{BRANCH}}` | the branch the run is pinned to |
 | `{{NEXT_HINT}}` | "By the plan's checklist the next open item is `…`" (or a note that none is visible) |
 | `{{SCOPE}}` | the `--until` instruction, or empty |
@@ -186,11 +248,14 @@ hooks or scripts can tell they are running unattended.
 | Path | What it is |
 | --- | --- |
 | `plan_loop.py` | the driver |
+| `loop_agents.py` | the agent adapters (claude, codex, gemini, custom) |
 | `prompt.md`, `continue.md` | the session prompts |
+| `tests/` | offline tests and the live smoke test (see Testing) |
 | `.ai-loop/driver.lock` | one driver per repo |
 | `.ai-loop/<plan>/driver.log` | one line per decision, for the whole run |
 | `.ai-loop/<plan>/logs/NNNN-<ts>.log` | readable transcript of session N, all its turns |
-| `.ai-loop/<plan>/logs/NNNN-<ts>.jsonl` | that session's raw stream-json |
+| `.ai-loop/<plan>/logs/NNNN-<ts>.jsonl` | that session's raw output (stream-json, JSONL or text) |
+| `.ai-loop/<plan>/logs/*.prompt.md` | the prompt of each turn, only for `--agent-cmd` templates with `{prompt_file}` |
 | `.ai-loop/<plan>/state.json` | counters, model benches (`limited_until`), cost, and per-turn history (context %, decision) |
 | `.ai-loop/<plan>/STOP`, `HALTED` | control and halt sentinels |
 
@@ -203,14 +268,17 @@ which is untracked, so sessions running `git add -A` can never stage it.
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `plan` (positional) | — | the plan file; the repo is found from its location |
+| `--agent` | `auto` | `claude`, `codex`, `gemini` or `custom`; also `AI_PLAN_LOOP_AGENT` (see Agents) |
+| `--agent-bin` | the binary on `PATH` | how to start the agent, e.g. a full path or `npx -y @openai/codex` |
+| `--agent-cmd` | none | command template for any other CLI; implies `--agent custom` |
 | `--until` | whole plan | stop once the item whose label contains this text is ticked |
 | `--max-milestones` / `--max-sessions` | `0` (no limit) | count this run only, not lifetime |
 | `--branch` | branch at start | halts if HEAD moves to another branch |
-| `--model` / `--fallback-model` | `fable` / `opus` | `--fallback-model ''` disables rotation |
-| `--effort` | `high` | |
-| `--permission-mode` | `bypassPermissions` | see Warnings |
+| `--model` / `--fallback-model` | claude: `fable` / `opus`; others: the CLI's default / none | `--fallback-model ''` disables rotation |
+| `--effort` | claude: `high`; codex: its config | values per agent: see Agents |
+| `--permission-mode` | the agent's fully unattended mode | values per agent: see Agents and Warnings |
 | `--context-threshold` | `0.30` | `30` also works: values of 1 and up are percentages |
-| `--context-window` | `200000` | only if the stream does not report a window |
+| `--context-window` | claude `200000`, codex `272000`, gemini `1000000` | only if the agent does not report a window |
 | `--max-turns-per-session` | `0` (off) | extra rotation cap |
 | `--prompt-file` / `--continue-file` / `--append-prompt-file` | `prompt.md` / `continue.md` / none | |
 | `--open-regex` / `--done-regex` | top-level `- [ ]` / `- [x]` | ledger format |
@@ -220,9 +288,11 @@ which is untracked, so sessions running `git add -A` can never stage it.
 | `--limit-max-sleep-s` | `43200` | re-probe a benched model at least this often |
 | `--max-consecutive-stalls` / `-errors` / `--max-fast-failures` | `2` / `3` / `10` | halt thresholds |
 | `--preflight` | none | shell command (cmd.exe on Windows) that must exit 0 before each turn; probed every `--preflight-probe-s` (300) up to `--preflight-max-probes` (24) times |
-| `--max-budget-usd` | none | per-turn cap; only bites on API-key billing |
+| `--max-budget-usd` | none | per-turn cap, Claude only; only bites on API-key billing |
 
-## Verified CLI facts (Claude Code 2.1.173, 2026-10-02)
+## CLI facts
+
+### Claude Code (verified live, 2.1.173, 2026-10-02)
 
 - A usage-limited model gives
   `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":<epoch>,"rateLimitType":"seven_day_overage_included",…}}`,
@@ -237,6 +307,65 @@ which is untracked, so sessions running `git add -A` can never stage it.
   A resumed turn hits the prompt cache.
 - `result.modelUsage["claude-opus-4-8"].contextWindow` was `1000000` for `--model opus`.
 - The base context of a fresh session in the repo the tool was developed in was about 35k tokens.
+- 2026-10-05, after the agent adapters: `tests/smoke_test.py` passed with `--model sonnet`
+  (`claude-sonnet-4-6`, 200k window). The run took 2 sessions and 3 milestones, and milestone 2
+  resumed at 16.7% context. It cost $0.88 in total, about $0.19 to $0.40 per turn.
+
+### OpenAI Codex CLI (from the docs and source, 2026-10-05; not yet run live)
+
+Confirm these with `python tests/smoke_test.py --agent codex` once codex is installed, then fix
+the adapter and this section.
+
+- `codex exec --json -` reads the prompt from stdin and writes JSONL: `thread.started
+  {thread_id}`, `turn.started`, `item.started|updated|completed {item}`, `turn.completed
+  {usage}`, `turn.failed {error}`, `error {message}`. The final answer is the last
+  `agent_message` item.
+- `codex exec resume <thread_id> -` continues a session. The exec flags (`--json`, `-m`, `-c`,
+  `--sandbox`, `--dangerously-bypass-approvals-and-sandbox`) are global, so they also work before
+  `resume`.
+- `turn.completed.usage` holds thread totals, not the last call. Per-call usage and
+  `model_context_window` are only in the rollout file's `token_count` events, which also carry
+  `rate_limits.{primary,secondary}.{used_percent,resets_at}`.
+- A usage limit arrives on stdout as `error` and then `turn.failed`, worded "You've hit your
+  usage limit. … try again at Sep 22nd, 2026 9:51 AM." (or "at 5:36 PM", or "in N hours").
+- The exit code on failure is unverified. The adapter treats a turn as failed unless
+  `turn.completed` arrived.
+- `--sandbox workspace-write` may keep `.git` read-only, which would make every commit fail.
+  This is why the default is `--dangerously-bypass-approvals-and-sandbox`.
+
+### Gemini CLI (from the docs and source, 2026-10-05; not yet run live)
+
+- `-p` forces headless mode and is appended to whatever comes on stdin. `--output-format
+  stream-json` emits `init {session_id, model}`, `message {role, content, delta}`, `tool_use`,
+  `tool_result`, `error {severity, message}` and `result {status, error, stats}`.
+- Assistant text arrives in `delta` chunks, which the adapter joins.
+- `stats` holds session totals only, so context is unknown.
+- `--resume` exists, but with it the CLI ignores a prompt on stdin (gemini-cli #14180). The
+  prompt cannot safely go on the command line through a `.cmd` shim, so the adapter never
+  resumes.
+- `--approval-mode yolo` replaced `--yolo`. The adapter checks `gemini --help` and falls back to
+  `--yolo` on older versions.
+- Quota wording: "You have exhausted your daily quota on this model.", "Your quota will reset
+  after 22h54m12s.", 429 `RESOURCE_EXHAUSTED`. The CLI retries on its own first, so a limited
+  turn can take longer than `--fast-fail-s`. That is harmless because limits are checked first.
+
+## Testing
+
+```powershell
+python -m unittest discover -s tests -v       # offline and free
+python tests\smoke_test.py                    # live: real Claude sessions, about $0.90
+python tests\smoke_test.py --agent all --keep # also codex / gemini when installed
+```
+
+- **Offline tests.** Each adapter's argv and parser is tested against recorded and documented
+  events. Claude's argv is compared with a frozen copy of the pre-adapter code, and its rendered
+  prompts with golden files, byte for byte. `test_driver_offline.py` runs the real driver
+  against `tests/fake_agent.py`, which ticks a box, commits and answers in each agent's output
+  format. It covers resume, rotation, usage limits and the prompt echo guard.
+- **Smoke test.** A throwaway repo gets a three-milestone plan (hello.txt, count.txt, then
+  summary.txt built from both), worked by the real agent. The test then checks the ticked
+  boxes, the file contents, the commits, `state.json`, and that milestone 2 resumed milestone 1's
+  session while milestone 3 got a fresh one.
 
 ## Warnings
 
@@ -244,6 +373,10 @@ which is untracked, so sessions running `git add -A` can never stage it.
   prompt forbids pushing, branch switching and rewriting history, but nothing *enforces* that.
   `--permission-mode auto` applies the account's normal allowlist instead. Calls outside it are
   then denied silently, which some milestones will not survive.
+- **The same goes for the other agents' defaults.** Codex runs with
+  `--dangerously-bypass-approvals-and-sandbox`, with no sandbox and no approvals. Gemini runs with
+  `--approval-mode yolo`. Both are the only modes in which an unattended session can reliably
+  commit. Run them in a repo and on a machine you are prepared to let an agent drive.
 - **It commits to your branch while you are away, and it decides design questions itself.**
   Every decision is supposed to be recorded in the plan. Review `git log` and the plan's
   decision entries before merging or pushing, and use `--max-milestones 1` for the parts of the
@@ -255,6 +388,8 @@ which is untracked, so sessions running `git add -A` can never stage it.
   need a prompt nobody will answer.
 - **Limit detection is best-effort beyond the structured event.** If the chain halts with
   consecutive fast failures exactly when a limit was expected, read the tail of that session's
-  `.log` and teach `LIMIT_TEXT_RE` the new wording.
-- **Cost is logged, not capped**, unless you pass `--max-budget-usd`, which only applies on
-  API-key billing. `state.json` holds the running total.
+  `.log` and teach the agent's regexes in `loop_agents.py` the new wording. This applies doubly
+  to Codex and Gemini, whose wordings come from bug reports rather than a live run.
+- **Cost is logged, not capped**, unless you pass `--max-budget-usd`, which only applies to
+  Claude on API-key billing. `state.json` holds the running total. Codex and Gemini report no
+  cost, so their total stays at $0.
