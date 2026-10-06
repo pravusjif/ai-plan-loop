@@ -77,6 +77,24 @@ class ClaudeArgvTest(unittest.TestCase):
         d.unavailable.add("opus")
         self.assertNotIn("--fallback-model", d.argv("fable", None, "x"))
 
+    def test_agent_persona(self):
+        """A second driver can run a named agent; the plan loop never passes one."""
+        d = driver()
+        d.state = {"limited_until": {}}
+        self.assertNotIn("--agent", d.argv("fable", None, "x"))
+        got = d.argv("fable", None, "x", agent_name="game-designer")
+        self.assertEqual(got[got.index("--agent") + 1], "game-designer")
+        resumed = d.argv("fable", "sid-1", "x", agent_name="game-designer")
+        self.assertIn("--resume", resumed)
+        self.assertIn("--agent", resumed)
+
+    def test_session_runner_is_importable_alone(self):
+        from loop_runner import SessionRunner
+        self.assertTrue(issubclass(plan_loop.Driver, SessionRunner))
+        d = driver()
+        self.assertEqual(d.state_dir.name, "PLAN-md")
+        self.assertEqual(d.log_dir, d.state_dir / "logs")
+
     def test_invalid_permission_is_an_error(self):
         cfg = plan_loop.parse_args(["PLAN.md", "--permission-mode", "yolo"])
         errors, _ = resolve_options(ClaudeAgent(), cfg)

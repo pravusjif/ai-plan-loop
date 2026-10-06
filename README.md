@@ -11,7 +11,7 @@ and can check the environment before each turn with an optional `--preflight` co
 
 ## Install
 
-The tool is `plan_loop.py`, `loop_agents.py` and the two prompt files. It needs Python 3.9+
+The tool is `plan_loop.py`, `loop_runner.py`, `loop_agents.py` and the two prompt files. It needs Python 3.9+
 (stdlib only) and one agent CLI: `claude`, `codex` or `gemini` on `PATH`, or any other through
 `--agent-cmd`. Put it in the repo whose plan it should work through. The examples below assume
 `tools/ai_plan_loop/`:
@@ -252,7 +252,8 @@ hooks or scripts can tell they are running unattended.
 
 | Path | What it is |
 | --- | --- |
-| `plan_loop.py` | the driver |
+| `plan_loop.py` | the driver: the plan ledger, the prompts and the milestone schedule |
+| `loop_runner.py` | `SessionRunner`: one agent process, model benches, state, lock and logs -- what any other unattended chain imports (its docstring shows how) |
 | `loop_agents.py` | the agent adapters (claude, codex, gemini, custom) |
 | `prompt.md`, `continue.md` | the session prompts |
 | `tests/` | offline tests and the live smoke test (see Testing) |

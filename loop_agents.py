@@ -235,6 +235,9 @@ class TurnSpec(NamedTuple):
     prompt_file: str
     plan: str
     repo: str
+    # A named agent persona for the session (`claude --agent <name>`); None
+    # runs the CLI's default agent. Only Claude Code honours it today.
+    agent: str | None = None
 
 
 # ------------------------------------------------------------ reset parsing
@@ -650,6 +653,8 @@ class ClaudeAgent(Agent):
             argv += ["--resume", t.resume_id]
         else:
             argv += ["--name", t.name]
+        if t.agent:
+            argv += ["--agent", t.agent]
         # The CLI fallback only covers overload inside a call; usage limits are
         # per model and long-lived, so the driver rotates for those itself.
         if t.fallback:
