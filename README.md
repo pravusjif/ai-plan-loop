@@ -25,11 +25,11 @@ git submodule add <this repo's URL> tools/ai_plan_loop   # or copy the files the
 From anywhere inside the repo:
 
 ```powershell
-python tools\ai_plan_loop\plan_loop.py docs\PLAN.md --dry-run           # shows the parse, the command and both prompts; runs nothing
-python tools\ai_plan_loop\plan_loop.py docs\PLAN.md --max-milestones 1  # do this first: one milestone, then stop
-python tools\ai_plan_loop\plan_loop.py docs\PLAN.md                     # until the plan is done
-python tools\ai_plan_loop\plan_loop.py docs\PLAN.md --until "6. Build"  # stop once that item is ticked
-python tools\ai_plan_loop\plan_loop.py docs\PLAN.md --agent codex      # Codex instead of Claude
+python <REPO-CLONE-PARENT>\ai_plan_loop\plan_loop.py docs\PLAN.md --dry-run           # shows the parse, the command and both prompts; runs nothing
+python <REPO-CLONE-PARENT>\ai_plan_loop\plan_loop.py docs\PLAN.md --max-milestones 1  # do this first: one milestone, then stop
+python <REPO-CLONE-PARENT>\ai_plan_loop\plan_loop.py docs\PLAN.md                     # until the plan is done
+python <REPO-CLONE-PARENT>\ai_plan_loop\plan_loop.py docs\PLAN.md --until "6. Build"  # stop once that item is ticked
+python <REPO-CLONE-PARENT>\ai_plan_loop\plan_loop.py docs\PLAN.md --agent codex      # Codex instead of Claude
 ```
 
 | To stop | Do this |
@@ -84,8 +84,8 @@ If the tool echoes the prompt, only what comes after the echo counts, because th
 contains `LOOP_STATUS: PLAN_COMPLETE`.
 
 ```powershell
-python plan_loop.py docs\PLAN.md --agent-cmd "aider --yes-always --message-file {prompt_file}"
-python plan_loop.py docs\PLAN.md --agent codex --agent-bin "npx -y @openai/codex"
+python plan_loop.py <YOUR-PROJECT>\docs\PLAN.md --agent-cmd "aider --yes-always --message-file {prompt_file}"
+python plan_loop.py <YOUR-PROJECT>\docs\PLAN.md --agent codex --agent-bin "npx -y @openai/codex"
 ```
 
 `--agent-bin` starts a supported agent from somewhere other than `PATH`. On Windows, npm installs
