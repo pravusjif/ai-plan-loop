@@ -82,6 +82,18 @@ class DriverOfflineTest(unittest.TestCase):
         until = self.state()["limited_until"]["fake"]
         self.assertGreater(until, before + 3600)
 
+    def test_restart_clears_benches(self):
+        args = ("--agent", "claude", "--agent-bin", FAKE, "--model", "fake",
+                "--fallback-model", "")
+        self.run_loop(*args, env={"FAKE_AGENT_SCENARIO": "limit"})
+        self.assertGreater(self.state()["limited_until"]["fake"], time.time())
+        (self.state_dir / "STOP").unlink()
+        p = self.run_loop(*args)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("-- cleared: a restart re-checks the quota", self.driver_log)
+        self.assertIn("PLAN COMPLETE", self.driver_log)
+        self.assertNotIn("every model is usage-limited", self.driver_log.split("cleared")[-1])
+
     def test_codex_resumes_with_rollout_context(self):
         home = tempfile.mkdtemp()
         try:

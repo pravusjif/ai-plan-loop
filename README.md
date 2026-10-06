@@ -119,8 +119,10 @@ newline.
    fresh context is the better second attempt. Set the threshold with `--context-threshold`.
 6. **Usage limits.** A usage limit is not counted as a failure. The limited model is benched
    until the server's reset time, and the other model takes over immediately. When every model
-   is benched, the driver sleeps until the earliest reset and then starts a fresh session. The
-   reset time is worked out in this order:
+   is benched, the driver sleeps until the earliest reset and then starts a fresh session.
+   Restarting the driver clears every bench, so the first session checks the quota again. Use
+   this after buying extra usage or when a limit lifts early. The reset time is worked out in
+   this order:
    1. The exact `resetsAt` epoch from the stream's `rate_limit_event`. It has no timezone
       ambiguity, so the driver waits until 2 minutes after it (`--limit-margin-s`).
    2. A `usage limit reached|<epoch>` message.
