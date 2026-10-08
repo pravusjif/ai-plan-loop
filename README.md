@@ -48,25 +48,25 @@ The driver does not care which agent does the work. Each supported CLI has an ad
 and how it words a usage limit or an unknown model. Everything else is the same for all of them:
 the ledger, git-based progress, checkpoints, state and halting.
 
-**Which agent runs.** `--agent claude|codex|gemini|custom`, else the `AI_PLAN_LOOP_AGENT`
-environment variable, else `auto`. Auto uses `claude` if it is on `PATH`. Otherwise it uses the
-one other supported CLI it finds, and stops with a list if it finds both or neither. The driver
-never guesses from files in the repo: `AGENTS.md` is shared by several agents, and a file says
-nothing about which agent you want to pay for. The banner and every `state.json` history entry
+**Which agent runs.** `--agent claude|codex|gemini|dsh|custom`, else the `AI_PLAN_LOOP_AGENT`
+environment variable, else `auto`. Auto uses `claude` if it is on `PATH`. Otherwise it uses
+`codex` or `gemini`, whichever it finds, and stops with a list if it finds both or neither. Auto
+never picks `dsh`. The driver never guesses from files in the repo: `AGENTS.md` is shared by
+several agents, and a file says nothing about which agent you want to pay for. The banner and every `state.json` history entry
 name the agent that ran.
 
-| | `claude` | `codex` | `gemini` | `custom` |
-| --- | --- | --- | --- | --- |
-| Command | `claude -p --output-format stream-json` | `codex exec --json -` | `gemini --output-format stream-json -p …` | your `--agent-cmd` |
-| Prompt | stdin | stdin | stdin | stdin, or a file with `{prompt_file}` |
-| Resumes a session | yes (`--resume`) | yes (`codex exec resume <id>`) | no: fresh session per milestone | no |
-| Measures context | yes, from the stream | from the session's rollout file in `$CODEX_HOME/sessions` | no | no |
-| Cost in `state.json` | yes | no | no | no |
-| Default model | `fable`, falling back to `opus` | the CLI's own (`~/.codex/config.toml`) | the CLI's own | — |
-| `--effort` | `low` … `max` (default `high`) | `minimal` … `xhigh`, `max` = `xhigh` (default: CLI config) | ignored | passed as `{effort}` |
-| `--permission-mode` | `bypassPermissions` (default), `acceptEdits`, `auto`, `default`, `dontAsk`, `plan` | `bypass` (default), `workspace-write` | `yolo` (default), `auto_edit` | ignored |
-| Instructions file named in the prompt | `CLAUDE.md` | `AGENTS.md` | `GEMINI.md or AGENTS.md` | `AGENTS.md` |
-| Verified live | yes | **not yet** | **not yet** | through the tests |
+| | `claude` | `codex` | `gemini` | `dsh` | `custom` |
+| --- | --- | --- | --- | --- | --- |
+| Command | `claude -p --output-format stream-json` | `codex exec --json -` | `gemini --output-format stream-json -p …` | `dsh --profile headless --json -` | your `--agent-cmd` |
+| Prompt | stdin | stdin | stdin | stdin | stdin, or a file with `{prompt_file}` |
+| Resumes a session | yes (`--resume`) | yes (`codex exec resume <id>`) | no: fresh session per milestone | yes (`--session-id <id>`) | no |
+| Measures context | yes, from the stream | from the session's rollout file in `$CODEX_HOME/sessions` | no | yes, from the stream; the window from the session log in `$DSH_HOME/sessions` | no |
+| Cost in `state.json` | yes | no | no | no | no |
+| Default model | `fable`, falling back to `opus` | the CLI's own (`~/.codex/config.toml`) | the CLI's own | the profile's own; `--model <provider>/<model>` overrides it through a generated `--patch` file | — |
+| `--effort` | `low` … `max` (default `high`) | `minimal` … `xhigh`, `max` = `xhigh` (default: CLI config) | ignored | ignored | passed as `{effort}` |
+| `--permission-mode` | `bypassPermissions` (default), `acceptEdits`, `auto`, `default`, `dontAsk`, `plan` | `bypass` (default), `workspace-write` | `yolo` (default), `auto_edit` | `danger-full-access` (default), `workspace-write`, `read-only`, as `DSH_PERMISSION_MODE` | ignored |
+| Instructions file named in the prompt | `CLAUDE.md` | `AGENTS.md` | `GEMINI.md or AGENTS.md` | `AGENTS.md or CLAUDE.md` | `AGENTS.md` |
+| Verified live | yes | **not yet** | **not yet** | yes (no usage limit seen yet) | through the tests |
 
 What each adapter assumes about its CLI is written down at the top of that adapter's section in
 `loop_agents.py`: event formats, limit wording, exit codes, where each fact came from, and
@@ -256,7 +256,7 @@ hooks or scripts can tell they are running unattended.
 | --- | --- |
 | `plan_loop.py` | the driver: the plan ledger, the prompts and the milestone schedule |
 | `loop_runner.py` | `SessionRunner`: one agent process, model benches, state, lock and logs -- what any other unattended chain imports (its docstring shows how) |
-| `loop_agents.py` | the agent adapters (claude, codex, gemini, custom) |
+| `loop_agents.py` | the agent adapters (claude, codex, gemini, dsh, custom) |
 | `prompt.md`, `continue.md` | the session prompts |
 | `tests/` | offline tests and the live smoke test (see Testing) |
 | `.ai-loop/driver.lock` | one driver per repo |
@@ -276,7 +276,7 @@ which is untracked, so sessions running `git add -A` can never stage it.
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `plan` (positional) | — | the plan file; the repo is found from its location |
-| `--agent` | `auto` | `claude`, `codex`, `gemini` or `custom`; also `AI_PLAN_LOOP_AGENT` (see Agents) |
+| `--agent` | `auto` | `claude`, `codex`, `gemini`, `dsh` or `custom`; also `AI_PLAN_LOOP_AGENT` (see Agents) |
 | `--agent-bin` | the binary on `PATH` | how to start the agent, e.g. a full path or `npx -y @openai/codex` |
 | `--agent-cmd` | none | command template for any other CLI; implies `--agent custom` |
 | `--until` | whole plan | stop once the item whose label contains this text is ticked |

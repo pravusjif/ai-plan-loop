@@ -10,6 +10,7 @@ state, checkpoints -- lives in plan_loop.py and is the same for every agent.
   claude  Claude Code    `claude -p --output-format stream-json`   verified live
   codex   OpenAI Codex   `codex exec --json -`                    from docs, not yet run live
   gemini  Gemini CLI     `gemini --output-format stream-json -p`  from docs, not yet run live
+  dsh     DeepSeek dsh   `dsh --profile headless --json -`        verified live
   custom  any CLI        `--agent-cmd "tool {prompt_file}"`       plain text output
 
 What each adapter assumes about its CLI, where that comes from and whether it
@@ -26,10 +27,12 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple
+from urllib.parse import urlsplit
 
 IS_WINDOWS = os.name == "nt"
 
@@ -119,6 +122,8 @@ CLAUDE_PARENT_VARS = frozenset({
 CODEX_PARENT_VARS = frozenset({"CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED",
                                "CODEX_THREAD_ID"})
 GEMINI_PARENT_VARS = frozenset({"GEMINI_CLI"})
+# Seen live in a dsh 0.2.0-rc.2 bash tool. DSH_HOME is a user setting and passes through.
+DSH_PARENT_VARS = frozenset({"DSH_SESSION_ID", "DSH_PROFILE", "DSH_PROFILE_DIR", "DSH_SHELL"})
 
 # cmd.exe re-parses the command line of a .cmd/.bat shim (npm installs codex and
 # gemini that way), so these characters in an argument are mangled or worse.
@@ -434,6 +439,7 @@ class Agent:
     supports_budget = False
     reports_context = False
     reports_cost = False
+    named_agents = False                  # honours TurnSpec.agent (`claude --agent <name>`)
     uses_prompt_file = False
     instruction_files = "AGENTS.md"
     delegate_hint = ("and keep broad searches narrow so that only their conclusions enter\n"
@@ -506,6 +512,10 @@ class Agent:
 
     def argv(self, exe: list[str], cfg, t: TurnSpec) -> list[str]:
         raise NotImplementedError
+
+    def env(self, cfg) -> dict[str, str]:
+        """Environment the turn's process needs on top of the driver's own."""
+        return {}
 
     def stdin_payload(self, prompt: str) -> str | None:
         """What goes on stdin; None means the prompt travels in a file."""
@@ -636,6 +646,7 @@ class ClaudeAgent(Agent):
     supports_budget = True
     reports_context = True
     reports_cost = True
+    named_agents = True
     instruction_files = "CLAUDE.md"
     delegate_hint = ("and hand broad searches and big readings to\n"
                      "subagents so that only their conclusions enter your context")
@@ -1040,6 +1051,242 @@ class GeminiAgent(Agent):
         return bool(GEMINI_UNAVAILABLE_RE.search(res.haystack))
 
 
+# --- DeepSeek Harness (dsh) ----------------------------------------------------------
+#
+# Verified live against dsh 0.2.0-rc.2 (2026-10-08), headless profile, on a
+# local llama-swap provider:
+#   * `dsh --profile headless --json -` reads the prompt from stdin and writes
+#     NDJSON: {"type":"session","sessionId"}, status events with a "phase"
+#     (turn_start, step_start, step_end with usage, turn_end with a reason),
+#     {"type":"text"}, {"type":"tool_call","tool","input"}, {"type":"tool_result",
+#     "status","result"} and last {"type":"final","text"}.
+#   * step_end usage.totalTokens = inputTokens + cacheReadTokens + outputTokens:
+#     what the model saw on that step, i.e. the session's context.
+#   * turn_end reason {"kind":"completed"}, or {"kind":"error","error":{"code",
+#     "message"}} with exit 1 and `dsh: CODE: message` on stderr.
+#     MISSING_CREDENTIAL / "No API key for provider" (no key for the provider)
+#     and UNKNOWN_MODEL (`provider "x" has no configured model "y"`) both come
+#     back in under a second.
+#   * `--session-id <id>` continues a session with its context.
+#   * There is no model flag: launcher `--patch <file>` overlays rewrite the
+#     `agent-default-model` entry, so a --model `provider/model` becomes a
+#     generated patch file. Permissions come from $DSH_PERMISSION_MODE
+#     (read-only, workspace-write, danger-full-access).
+#   * Instructions: both AGENTS.md and CLAUDE.md reach the model. Skills come
+#     from ~/.agents/skills and the project's .agents/skills (symlinks are
+#     followed), never .claude/skills. No `--agent` personas.
+#   * MCP servers are `@deepseek-ai/dsh-mcp-client` plugin entries, one per
+#     server, inserted by a profile or a `--patch`; the tools are named
+#     mcp__<server>__<tool> as in Claude Code, and connect at session start.
+#     With failOnStartupError false, a server that is down only hides its tools.
+#   * A provider's `apiKeyEnv` resolves from dsh's credential store when the
+#     variable is not exported.
+#   * The stream carries no model name or window; the session log
+#     ($DSH_HOME/sessions/*/<id>/session.v4.jsonl.zstd) has both in its
+#     `request/context` event, read best effort after the turn.
+# Not seen yet: a usage limit or rate limit; the generic wording is used.
+
+DSH_UNAVAILABLE_RE = re.compile(
+    r"\bUNKNOWN_MODEL\b|has no configured model|\bMISSING_CREDENTIAL\b|"
+    r"no API key for provider",
+    re.IGNORECASE,
+)
+DSH_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def dsh_home() -> Path:
+    return Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh")
+
+
+def _dsh_patch(stem: str, text: str, root: Path | None) -> Path:
+    """Write a launcher patch under the temp dir (or root), only when it changes.
+    Values are JSON-quoted, which is valid YAML."""
+    root = root or Path(tempfile.gettempdir()) / "ai-plan-loop-dsh"
+    path = root / (re.sub(r"[^A-Za-z0-9_.-]", "_", stem) + ".patch.yml")
+    if not path.is_file() or path.read_text(encoding="utf-8") != text:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return path
+
+
+def dsh_model_patch(model: str, root: Path | None = None) -> Path:
+    """A launcher patch that makes `provider/model` the session's model."""
+    provider, _, model_id = model.partition("/")
+    return _dsh_patch(model, "- id: agent-default-model\n"
+                             "  name: \"@deepseek-ai/dsh-agent-default-model\"\n"
+                             "  config:\n"
+                             f"    provider: {json.dumps(provider)}\n"
+                             f"    model: {json.dumps(model_id)}\n", root)
+
+
+def dsh_mcp_patch(server: str, url: str, root: Path | None = None) -> Path:
+    """A launcher patch that adds the streamable-http MCP server `server` at url.
+    The port is in the file name: two runs using one server name on different
+    ports must not rewrite each other's patch."""
+    port = urlsplit(url).port or "default"
+    return _dsh_patch(f"mcp-{server}-{port}", "- insert:\n"
+                                        f"    - id: {json.dumps('ai-plan-loop-mcp-' + server)}\n"
+                                        "      name: \"@deepseek-ai/dsh-mcp-client\"\n"
+                                        "      config:\n"
+                                        f"        serverName: {json.dumps(server)}\n"
+                                        "        transport: streamable-http\n"
+                                        f"        url: {json.dumps(url)}\n"
+                                        "        failOnStartupError: false\n", root)
+
+
+def read_dsh_session(session_id: str, home: Path | None = None) -> dict:
+    """{"model", "ctx_window"} from the session log's last request/context
+    event, or {} when the log or a zstd decoder is not at hand."""
+    if not DSH_SESSION_RE.match(session_id or ""):
+        return {}
+    logs = sorted((home or dsh_home()).glob(f"sessions/*/{session_id}/session.v*.jsonl*"))
+    if not logs:
+        return {}
+    path = logs[-1]
+    if path.suffix == ".zstd":
+        try:
+            from compression import zstd  # Python 3.14+
+            text = zstd.decompress(path.read_bytes()).decode("utf-8", "replace")
+        except ImportError:
+            exe = shutil.which("zstd")
+            if not exe:
+                return {}
+            p = subprocess.run([exe, "-dc", str(path)], capture_output=True, timeout=30)
+            if p.returncode != 0:
+                return {}
+            text = p.stdout.decode("utf-8", "replace")
+    else:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    facts: dict = {}
+    for line in text.splitlines():
+        if '"request/context"' not in line:
+            continue
+        try:
+            data = json.loads(line).get("data") or {}
+        except json.JSONDecodeError:
+            continue
+        if data.get("model"):
+            facts["model"] = f"{data.get('provider') or '?'}/{data['model']}"
+        if data.get("contextWindow"):
+            facts["ctx_window"] = int(data["contextWindow"])
+    return facts
+
+
+class DshParser(StreamParser):
+    """`dsh --json` NDJSON, verified against 0.2.0-rc.2."""
+
+    def __init__(self) -> None:
+        self.reason: dict = {}
+
+    def feed(self, line: str, res: TurnResult, log) -> None:
+        ev = _json(line, log)
+        if ev is None:
+            return
+        kind = ev.get("type")
+        if kind == "session":
+            res.session_id = ev.get("sessionId") or res.session_id
+            log(f"[{now()}] session_id={res.session_id}")
+        elif kind == "text":
+            text = (ev.get("text") or "").strip()
+            if text:
+                log(text)
+        elif kind == "tool_call":
+            log(f"  -> {ev.get('tool', '?')}{tool_hint(ev.get('input') or {})}")
+        elif kind == "tool_result":
+            if ev.get("status") not in (None, "completed"):
+                log(f"  <- {ev.get('status')}")
+        elif kind == "status":
+            phase = ev.get("phase")
+            if phase == "step_end":
+                res.num_turns += 1
+                total = int((ev.get("usage") or {}).get("totalTokens") or 0)
+                if total > 0:
+                    res.ctx_tokens = total
+            elif phase == "turn_end":
+                self.reason = ev.get("reason") or {}
+                err = self.reason.get("error") or {}
+                if err:
+                    res.errors.append(f"{err.get('code') or ''}: {err.get('message') or ''}")
+        elif kind == "final":
+            res.result_text = ev.get("text") or ""
+
+    def finish(self, res: TurnResult, log) -> None:
+        kind = self.reason.get("kind") or "none"
+        res.is_error = res.exit_code != 0 or kind != "completed"
+        res.subtype = "success" if not res.is_error else kind
+        log("")
+        log(f"[{now()}] --- result: turn_end={kind} exit={res.exit_code} steps={res.num_turns}")
+        for err in res.errors:
+            log(err)
+
+
+class DshAgent(Agent):
+    name = "dsh"
+    binary = "dsh"
+    title = "DeepSeek Harness"
+    profile = "headless"
+    default_permission = "danger-full-access"
+    permissions = {p: [] for p in ("danger-full-access", "workspace-write", "read-only")}
+    # The profile's own window is read from the session log; this is the
+    # fallback when that fails.
+    default_context_window = 128_000
+    supports_resume = True
+    reports_context = True
+    instruction_files = "AGENTS.md or CLAUDE.md"
+    parent_session_vars = DSH_PARENT_VARS
+    verified = True
+
+    def __init__(self) -> None:
+        # More launcher patches for every turn, after the model's (a driver's MCP server).
+        self.extra_patches: list[Path] = []
+
+    def validate(self, cfg, explicit: set[str]) -> tuple[list[str], list[str]]:
+        errors, warnings = super().validate(cfg, explicit)
+        for flag, model in (("--model", cfg.model), ("--fallback-model", cfg.fallback_model)):
+            if self.model_arg(model or "") and "/" not in model:
+                errors.append(f"{flag} {model}: dsh names a model as <provider>/<model> from "
+                              f"the profile's providers, e.g. deepseek-official/deepseek-flash")
+        return errors, warnings
+
+    def has_profile(self, exe: list[str]) -> bool:
+        """`dsh --profile x ...` or `dsh x ...` in --agent-bin picks the profile."""
+        return "--profile" in exe[1:] or (len(exe) > 1 and not exe[1].startswith("-"))
+
+    def argv(self, exe: list[str], cfg, t: TurnSpec) -> list[str]:
+        argv = [*exe] if self.has_profile(exe) else [*exe, "--profile", self.profile]
+        model = self.model_arg(t.model)
+        if model:
+            argv += ["--patch", str(dsh_model_patch(model))]
+        for patch in self.extra_patches:
+            argv += ["--patch", str(patch)]
+        argv += ["--json"]
+        if t.resume_id:
+            argv += ["--session-id", t.resume_id]
+        return argv + ["-"]  # the prompt comes on stdin
+
+    def env(self, cfg) -> dict[str, str]:
+        return {"DSH_PERMISSION_MODE": cfg.permission_mode} if cfg.permission_mode else {}
+
+    def new_parser(self, prompt: str) -> StreamParser:
+        return DshParser()
+
+    def after_turn(self, res: TurnResult, repo: Path, log) -> None:
+        try:
+            facts = read_dsh_session(res.session_id)
+        except Exception as exc:  # never let a best-effort read break a turn
+            log(f"[{now()}] dsh session log not readable: {exc}")
+            return
+        res.model_name = facts.get("model") or res.model_name
+        res.ctx_window = facts.get("ctx_window", res.ctx_window)
+
+    def limit_signal(self, res: TurnResult, probe_s: int) -> LimitSignal | None:
+        return text_limit(res, probe_s, bool(LIMIT_TEXT_RE.search(res.haystack)),
+                          [parse_reset_text, parse_try_again, parse_reset_after])
+
+    def model_unavailable(self, res: TurnResult) -> bool:
+        return bool(DSH_UNAVAILABLE_RE.search(res.haystack))
+
+
 # --- any CLI, from a command template ------------------------------------------------
 
 CUSTOM_PLACEHOLDERS = ("{prompt_file}", "{model}", "{effort}", "{plan}", "{repo}", "{name}")
@@ -1139,9 +1386,11 @@ class CustomAgent(Agent):
 
 # ---------------------------------------------------------------- selection
 
-AGENTS: dict[str, type] = {"claude": ClaudeAgent, "codex": CodexAgent, "gemini": GeminiAgent}
+AGENTS: dict[str, type] = {"claude": ClaudeAgent, "codex": CodexAgent, "gemini": GeminiAgent,
+                           "dsh": DshAgent}
 AUTO_ORDER = ("claude", "codex", "gemini")
-ALL_PARENT_VARS = CLAUDE_PARENT_VARS | CODEX_PARENT_VARS | GEMINI_PARENT_VARS
+ALL_PARENT_VARS = (CLAUDE_PARENT_VARS | CODEX_PARENT_VARS | GEMINI_PARENT_VARS
+                   | DSH_PARENT_VARS)
 
 
 def select_agent(choice: str | None, agent_cmd: str | None, agent_bin: str | None,

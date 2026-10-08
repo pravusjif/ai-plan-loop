@@ -276,6 +276,7 @@ class SessionRunner:
         # settings such as CLAUDE_CONFIG_DIR or CODEX_HOME pass through.
         env = {k: v for k, v in os.environ.items() if k not in ALL_PARENT_VARS}
         env.update(PYTHONIOENCODING="utf-8", AI_PLAN_LOOP="1", AI_PLAN_LOOP_PLAN=self.plan_rel)
+        env.update(self.agent.env(self.cfg))
         env.update(self.extra_env)
         proc = subprocess.Popen(argv, cwd=str(self.repo), env=env,
                                 stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,

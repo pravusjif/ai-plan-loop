@@ -490,9 +490,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("plan", help="the plan to work through, e.g. docs/PLAN.md")
     g = p.add_argument_group("agent")
     g.add_argument("--agent", default=None,
-                   help="auto (default), claude, codex, gemini or custom; also "
+                   help="auto (default), claude, codex, gemini, dsh or custom; also "
                         "$AI_PLAN_LOOP_AGENT. auto = claude if on PATH, else the one "
-                        "other supported CLI found")
+                        "of codex and gemini found; dsh is never picked by auto")
     g.add_argument("--agent-bin", default=None, metavar="CMD",
                    help="the command that starts the agent, when it is not the plain "
                         "binary on PATH (e.g. a full path, or 'npx @openai/codex')")

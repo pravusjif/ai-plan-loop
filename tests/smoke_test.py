@@ -7,6 +7,7 @@ run it by hand:
     python tests/smoke_test.py                  # claude
     python tests/smoke_test.py --agent codex    # skipped if codex is not installed
     python tests/smoke_test.py --agent all --keep
+    python tests/smoke_test.py --agent dsh -- --agent-bin "dsh --patch my.patch.yml" --model p/m
 
 The flags force both session paths: --context-threshold 0.9 makes milestone 2
 resume milestone 1's session, and --max-turns-per-session 2 makes milestone 3
@@ -46,6 +47,7 @@ PER_AGENT = {
                "--max-budget-usd", "0.50"],
     "codex": ["--effort", "low"],
     "gemini": [],
+    "dsh": [],
 }
 
 
@@ -59,7 +61,7 @@ def check(cond: bool, what: str) -> None:
         raise Failed(what)
 
 
-def smoke(agent: str, keep: bool) -> bool:
+def smoke(agent: str, keep: bool, extra: list[str]) -> bool:
     print(f"\n=== smoke: {agent} ===")
     if not find_exe(agent):
         print(f"  SKIP: {agent} is not on PATH")
@@ -70,7 +72,7 @@ def smoke(agent: str, keep: bool) -> bool:
     state_dir = repo / ".ai-loop" / "PLAN-md"
     print(f"  repo {repo}")
     argv = [sys.executable, str(PLAN_LOOP), str(repo / "PLAN.md"), "--agent", agent,
-            *COMMON, *PER_AGENT[agent]]
+            *COMMON, *PER_AGENT[agent], *extra]
     print("  $ " + " ".join(argv))
     try:
         code = subprocess.run(argv, cwd=str(repo), timeout=1800,
@@ -145,11 +147,14 @@ def smoke(agent: str, keep: bool) -> bool:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--agent", default="claude", choices=["claude", "codex", "gemini", "all"])
+    p.add_argument("--agent", default="claude",
+                   choices=["claude", "codex", "gemini", "dsh", "all"],
+                   help="all = claude, codex and gemini; dsh runs only by name")
     p.add_argument("--keep", action="store_true", help="keep the temp repo even on success")
+    p.add_argument("extra", nargs="*", help="after --: more plan_loop.py flags")
     args = p.parse_args()
     agents = ["claude", "codex", "gemini"] if args.agent == "all" else [args.agent]
-    results = {a: smoke(a, args.keep) for a in agents}
+    results = {a: smoke(a, args.keep, args.extra) for a in agents}
     print("\n" + ", ".join(f"{a}: {'PASS' if ok else 'FAIL'}" for a, ok in results.items()))
     return 0 if all(results.values()) else 1
 
