@@ -297,12 +297,9 @@ class Driver(SessionRunner):
 
                 log("")
                 log(f"exit_code   {res.exit_code}")
-                log(f"duration    {res.duration_s / 60:.1f} min")
-                log(f"cost        ${res.cost_usd:.2f}")
                 log(f"HEAD        {head_before[:12]} -> {head_after[:12]}"
                     + ("  (committed)" if committed else "  (NO COMMIT)"))
                 log(f"ticked      {' | '.join(landed) or '(none)'}")
-                log(f"context     {self._ctx_text(res)}")
                 log(f"LOOP_STATUS {status or '(none reported)'}")
 
                 # 1. Usage limit: not a failure. Bench this model and let the
@@ -409,7 +406,7 @@ class Driver(SessionRunner):
                 self.log(f"[{now()}] session #{index} turn {turn} LANDED on '{model}' -- "
                          f"{status or 'no status line'} | ticked: {' | '.join(landed) or 'none'} "
                          f"| {res.duration_s / 60:.0f} min | ${res.cost_usd:.2f} | "
-                         f"context {self._ctx_text(res)}")
+                         f"context {self.ctx_text(res)}")
 
                 # 7. Checkpoint: stop here if asked to.
                 if self.stop_file.exists():
@@ -458,14 +455,6 @@ class Driver(SessionRunner):
     def _milestone(self) -> None:
         self.state["milestones"] = self.state.get("milestones", 0) + 1
         self.milestones_this_run += 1
-
-    def _ctx_text(self, res: TurnResult) -> str:
-        pct = res.ctx_pct(self.cfg.context_window)
-        if pct is None:
-            return "unknown"
-        window = res.ctx_window or self.cfg.context_window
-        src = "" if res.ctx_window else " (window from --context-window)"
-        return f"{res.ctx_tokens:,} / {window:,} tokens = {pct:.1%}{src}"
 
     def _history(self, index, turn, model, res: TurnResult, status, committed, landed,
                  pct, decision) -> None:

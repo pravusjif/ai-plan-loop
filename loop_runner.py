@@ -328,7 +328,17 @@ class SessionRunner:
         parser.finish(res, log)
         self.agent.after_turn(res, self.repo, log)
         res.duration_s = time.monotonic() - started
+        log(f"[{now()}] --- session: {fmt_dur(res.duration_s)} · ${res.cost_usd:.2f} · "
+            f"context {self.ctx_text(res)}")
         return res
+
+    def ctx_text(self, res: TurnResult) -> str:
+        pct = res.ctx_pct(self.cfg.context_window)
+        if pct is None:
+            return "unknown"
+        window = res.ctx_window or self.cfg.context_window
+        src = "" if res.ctx_window else " (window from --context-window)"
+        return f"{res.ctx_tokens:,} / {window:,} tokens = {pct:.1%}{src}"
 
     # --- classification -------------------------------------------------------
 
