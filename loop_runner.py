@@ -63,6 +63,17 @@ def fmt_epoch(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
 
 
+def file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def fmt_size(n: int) -> str:
+    return f"{n / 1024:.1f} KB" if n >= 1024 else f"{n} B"
+
+
 class Log:
     """Console + file, so an unattended run is readable after the fact."""
 

@@ -58,8 +58,8 @@ from loop_agents import (  # noqa: E402
     unsafe_cmd_args,
 )
 from loop_runner import (  # noqa: E402,F401 -- re-exported for callers and tests
-    Halt, Log, SessionRunner, StopRequested, acquire_lock, banner, fmt_epoch, kill_tree,
-    run_cmd, stamp,
+    Halt, Log, SessionRunner, StopRequested, acquire_lock, banner, file_size, fmt_epoch,
+    fmt_size, kill_tree, run_cmd, stamp,
 )
 
 DEFAULT_PROMPT = HERE / "prompt.md"
@@ -282,8 +282,8 @@ class Driver(SessionRunner):
         log(f"agent       {self.agent.name}")
         log(f"model       {model} (effort {cfg.effort or 'agent default'})")
         log(f"open        {' | '.join(self.ledger.open_labels()) or '(untracked plan)'}")
-        log(f"plan        {self.plan_rel} {fmt_size(self.file_size(self.plan))}; progress log "
-            f"{self.progress_rel} {fmt_size(self.file_size(self.progress))}")
+        log(f"plan        {self.plan_rel} {fmt_size(file_size(self.plan))}; progress log "
+            f"{self.progress_rel} {fmt_size(file_size(self.progress))}")
         if dirty:
             log(f"NOTE: working tree already dirty ({len(dirty.splitlines())} paths) -- "
                 "the session is told to inspect it")
@@ -293,7 +293,7 @@ class Driver(SessionRunner):
             while True:
                 turn += 1
                 head_before = self.head()
-                plan_before = self.file_size(self.plan)
+                plan_before = file_size(self.plan)
                 done_before = self.ledger.done_labels()
                 open_before = self.ledger.open_labels()
                 if resume_id:
@@ -311,8 +311,8 @@ class Driver(SessionRunner):
                     if len(done_after) > len(done_before) else []
                 status = res.loop_status
                 pct = res.ctx_pct(cfg.context_window)
-                plan_after = self.file_size(self.plan)
-                progress_after = self.file_size(self.progress)
+                plan_after = file_size(self.plan)
+                progress_after = file_size(self.progress)
                 res.plan_bytes, res.progress_bytes = plan_after, progress_after
                 state["total_cost_usd"] = round(state["total_cost_usd"] + res.cost_usd, 4)
 
@@ -473,13 +473,6 @@ class Driver(SessionRunner):
         finally:
             log.close()
 
-    @staticmethod
-    def file_size(path: Path) -> int:
-        try:
-            return path.stat().st_size
-        except OSError:
-            return 0
-
     def _count(self, counted: bool, index: int) -> bool:
         if not counted:
             self.state["sessions"] = index
@@ -511,10 +504,6 @@ def default_progress_file(plan: Path) -> Path:
     """docs/PLAN.md -> docs/PLAN.progress.md, next to the plan."""
     suffix = plan.suffix or ".md"
     return plan.with_name(f"{plan.stem}.progress{suffix}")
-
-
-def fmt_size(n: int) -> str:
-    return f"{n / 1024:.1f} KB" if n >= 1024 else f"{n} B"
 
 
 # ----------------------------------------------------------------------- main
@@ -684,10 +673,10 @@ def main(argv: list[str] | None = None) -> int:
 
     banner(log, f"AI Plan Loop -- {now()}")
     log(f"repo        {repo}")
-    log(f"plan        {d.plan_rel} {fmt_size(d.file_size(plan))}"
+    log(f"plan        {d.plan_rel} {fmt_size(file_size(plan))}"
         + (f" (until '{cfg.until}')" if cfg.until else ""))
     log(f"progress    {d.progress_rel} "
-        + (fmt_size(d.file_size(d.progress)) if d.progress.exists() else "(not yet created)"))
+        + (fmt_size(file_size(d.progress)) if d.progress.exists() else "(not yet created)"))
     log(f"branch      {d.branch}")
     log(f"agent       {agent.name} ({' '.join(exe) or '?'}"
         + (f", {version}" if version else "") + f"; {chosen})")
