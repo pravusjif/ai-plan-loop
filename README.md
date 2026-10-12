@@ -100,9 +100,12 @@ newline.
    expires. Other agents use their CLI's own default model unless you pass one. Change the models
    with `--model` / `--fallback-model`. The fallback rotation works for every agent.
 2. **Effort.** Claude sessions run at `high` effort (`--effort`).
-3. **The plan is the only handoff.** Each session reads the plan named on the command line and
-   takes the next milestone that is not done. Nothing else carries between sessions: only the
-   plan, the code and the git history on disk.
+3. **The plan and the progress log are the only handoff.** Each session reads the plan named
+   on the command line in full, and the last entry of its progress log, then takes the next
+   milestone that is not done. Nothing else carries between sessions: those two files, the
+   code and the git history on disk. The plan holds what later milestones need (spec,
+   checklist, decisions, verified facts); the log holds what each landed milestone delivered
+   and how it was verified. See "The plan and the progress log".
 4. **One milestone per turn.** A *turn* is one agent process (`claude -p`, `codex exec`, …). It
    must end with a `LOOP_STATUS:` line. The end of a turn that lands a milestone is a
    **checkpoint**.
@@ -211,12 +214,39 @@ How the pieces work:
   changed and the cache is long gone. The next fresh session is told to start with
   `git status`, then finish or revert the work deliberately.
 
+## The plan and the progress log
+
+Every session reads the plan in full, and for Claude the first prompt mentions it with `@`, which
+inlines the whole file. So the plan's size is paid at the start of every session, before any
+work. Left alone, a plan grows with every milestone: delivery notes, verification evidence,
+decisions. After thirty milestones each new session would start with a context that is
+mostly history. The protocol therefore splits the handoff in two files by what a future
+milestone needs:
+
+| | The plan (`docs/PLAN.md`) | The progress log (`docs/PLAN.progress.md`) |
+| --- | --- | --- |
+| Holds | the spec, the checklist, decisions taken, verified facts, blockers | one entry per landed milestone: commit subject, what was delivered, how it was verified, what is open |
+| A done milestone | its line ticked, with at most one sentence and the commit's subject | a full entry, appended at the end, never edited |
+| Read by a session | in full, every session | the last entry only, plus a specific milestone's entry when the tree is dirty or that milestone was left partial |
+| Grows | only with decisions and verified facts | with every milestone, which is fine: nobody reads it whole |
+
+Sessions also get the checklist rendered into the continue prompt by the driver, so a resumed
+session does not re-read the plan it already read; it reads only the section of the milestone it
+takes. Both files are committed. The log lives next to the plan by default and `--progress-file`
+moves it. A plan that already carries history paragraphs is migrated by the sessions themselves,
+a few paragraphs at a time, never as a milestone of its own.
+
+The driver logs the plan's size at every turn, in the session log and as `plan_bytes` /
+`progress_bytes` in `state.json`'s history, and warns in `driver.log` when one turn grows the plan
+by more than `--plan-growth-warn` bytes (2000 by default). That warning means a session wrote
+history into the plan; read its transcript and tighten the plan's own instructions.
+
 ## The prompts
 
 | File | Sent | Purpose |
 | --- | --- | --- |
-| `prompt.md` | first turn of every session | The task (read the plan, do the next milestone, decide design questions yourself and record them), then the loop protocol: one milestone per turn, start with `git status`, stay on the branch, never push, commit every verified milestone in the repo's convention, the six-part definition of done, honest status over optimistic, leave the environment usable, spend context carefully, and the `LOOP_STATUS` line. |
-| `continue.md` | each further turn in the same session | "Checkpoint passed at N% context: re-read the plan from disk, check the tree, take the next milestone, same protocol." |
+| `prompt.md` | first turn of every session | The task (read the plan and the log's last entry, do the next milestone, decide design questions yourself and record them), then the loop protocol: one milestone per turn, start with `git status`, the two files and their jobs, stay on the branch, never push, commit every verified milestone in the repo's convention, the seven-part definition of done, honest status over optimistic, leave the environment usable, spend context carefully, and the `LOOP_STATUS` line. |
+| `continue.md` | each further turn in the same session | "Checkpoint passed at N% context: here is the checklist as the driver reads it, do not re-read the plan in full, check the tree, take the next milestone, same protocol." |
 
 The prompts are generic. Anything specific to a repo or plan belongs in that repo's instructions
 file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) and the plan itself, which every session reads first. For instructions that only make sense
@@ -230,6 +260,8 @@ Placeholders, substituted at send time:
 | --- | --- |
 | `{{PLAN}}` | the plan's path relative to the repo |
 | `{{PLAN_REF}}` | the plan as the agent should see it: `@docs/PLAN.md` (a Claude file mention) or the bare path |
+| `{{PROGRESS}}` | the progress log's path relative to the repo, never as a file mention: sessions read only its tail |
+| `{{CHECKLIST}}` | the ledger's items in scope, one `- [x]` / `- [ ]` line each (continue prompt only) |
 | `{{INSTRUCTIONS_FILES}}` | the agent's instructions file: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md or AGENTS.md` |
 | `{{DELEGATE_HINT}}` | how to keep big reads out of context: hand them to subagents (Claude), or keep searches narrow |
 | `{{BRANCH}}` | the branch the run is pinned to |
@@ -247,8 +279,8 @@ LOOP_STATUS: BLOCKED — <reason>
 LOOP_STATUS: PLAN_COMPLETE
 ```
 
-Sessions also get the environment variables `AI_PLAN_LOOP=1` and `AI_PLAN_LOOP_PLAN=<plan>`, so
-hooks or scripts can tell they are running unattended.
+Sessions also get the environment variables `AI_PLAN_LOOP=1`, `AI_PLAN_LOOP_PLAN=<plan>` and
+`AI_PLAN_LOOP_PROGRESS=<progress log>`, so hooks or scripts can tell they are running unattended.
 
 ## Files
 
@@ -259,6 +291,7 @@ hooks or scripts can tell they are running unattended.
 | `loop_agents.py` | the agent adapters (claude, codex, gemini, dsh, custom) |
 | `prompt.md`, `continue.md` | the session prompts |
 | `tests/` | offline tests and the live smoke test (see Testing) |
+| `<plan>.progress.md` (in your repo, next to the plan) | the progress log the sessions append to; `--progress-file` moves it |
 | `.ai-loop/driver.lock` | one driver per repo |
 | `.ai-loop/<plan>/driver.log` | one line per decision, for the whole run |
 | `.ai-loop/<plan>/logs/NNNN-<ts>.log` | readable transcript of session N, all its turns |
@@ -289,6 +322,8 @@ which is untracked, so sessions running `git add -A` can never stage it.
 | `--context-window` | claude `200000`, codex `272000`, gemini `1000000` | only if the agent does not report a window |
 | `--max-turns-per-session` | `0` (off) | extra rotation cap |
 | `--prompt-file` / `--continue-file` / `--append-prompt-file` | `prompt.md` / `continue.md` / none | |
+| `--progress-file` | `<plan>.progress.md` next to the plan | the log sessions append to; must be inside the repo and not the plan |
+| `--plan-growth-warn` | `2000` | warn in `driver.log` when one turn grows the plan by more bytes than this; `0` turns it off |
 | `--open-regex` / `--done-regex` | top-level `- [ ]` / `- [x]` | ledger format |
 | `--turn-timeout-s` | `14400` (4 h) | a hung turn is killed |
 | `--limit-probe-s` | `1200` | retry interval when the reset time is unknown |
@@ -313,7 +348,7 @@ python tests\smoke_test.py --agent all --keep # also codex / gemini when install
   format. It covers resume, rotation, usage limits and the prompt echo guard.
 - **Smoke test.** A throwaway repo gets a three-milestone plan (hello.txt, count.txt, then
   summary.txt built from both), worked by the real agent. The test then checks the ticked
-  boxes, the file contents, the commits, `state.json`, and that milestone 2 resumed milestone 1's
+  boxes, the progress log, the file contents, the commits, `state.json`, and that milestone 2 resumed milestone 1's
   session while milestone 3 got a fresh one.
 
 ## Warnings
@@ -327,8 +362,8 @@ python tests\smoke_test.py --agent all --keep # also codex / gemini when install
   `--approval-mode yolo`. Both are the only modes in which an unattended session can reliably
   commit. Run them in a repo and on a machine you are prepared to let an agent drive.
 - **It commits to your branch while you are away, and it decides design questions itself.**
-  Every decision is supposed to be recorded in the plan. Review `git log` and the plan's
-  decision entries before merging or pushing, and use `--max-milestones 1` for the parts of the
+  Every decision is supposed to be recorded in the plan. Review `git log`, the plan's
+  decision entries and the progress log before merging or pushing, and use `--max-milestones 1` for the parts of the
   plan you care most about.
 - **Shared, single-tenant resources.** Do not work in the same repo, or in the apps the plan
   drives (an editor, a game engine, a browser), while the chain runs. Your edits collide with a session's, and

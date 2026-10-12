@@ -33,7 +33,9 @@ The rules (README.md has the reasoning):
     checkbox ticked in the plan. Two turns in a row without either halt the chain.
 
 Each turn is a separate agent process. Nothing carries between sessions except
-what is on disk: the plan, the code and the git history.
+what is on disk: the plan, its progress log (<plan>.progress.md, one entry per
+landed milestone, so the plan itself stays the size of the work ahead), the code
+and the git history.
 
 Stdlib only. Verified against Claude Code 2.1.173.
 """
@@ -120,6 +122,13 @@ class Ledger:
     def done_labels(self) -> list[str]:
         return [lbl for _o, lbl, done in self.items() if done]
 
+    def checklist(self) -> str:
+        """The checklist as markdown, for a prompt: one line per item in scope."""
+        items = self.items()
+        if not items:
+            return "(the driver sees no checklist items in the plan; judge from the plan text)"
+        return "\n".join(f"- [{'x' if done else ' '}] {lbl}" for _o, lbl, done in items)
+
 
 # ---------------------------------------------------------------- the driver
 
@@ -132,6 +141,10 @@ class Driver(SessionRunner):
         slug = re.sub(r"[^A-Za-z0-9]+", "-", plan_rel).strip("-")
         super().__init__(cfg, repo, agent, exe, repo / ".ai-loop" / slug, label=plan_rel)
         self.plan = plan
+        self.progress = (Path(cfg.progress_file).resolve() if cfg.progress_file
+                         else default_progress_file(plan))
+        self.progress_rel = os.path.relpath(self.progress, repo).replace("\\", "/")
+        self.extra_env["AI_PLAN_LOOP_PROGRESS"] = self.progress_rel
         self.ledger = Ledger(plan, cfg.open_regex, cfg.done_regex, cfg.until)
         self.branch = ""
         self.ran_this_run = 0
@@ -153,6 +166,8 @@ class Driver(SessionRunner):
                 .replace("{{INSTRUCTIONS_FILES}}", self.agent.instruction_files)
                 .replace("{{DELEGATE_HINT}}", self.agent.delegate_hint)
                 .replace("{{PLAN}}", self.plan_rel)
+                .replace("{{PROGRESS}}", self.progress_rel)
+                .replace("{{CHECKLIST}}", self.ledger.checklist())
                 .replace("{{BRANCH}}", self.branch)
                 .replace("{{NEXT_HINT}}", hint)
                 .replace("{{SCOPE}}", scope)
@@ -266,7 +281,9 @@ class Driver(SessionRunner):
         log(f"HEAD        {self.head()[:12]}")
         log(f"agent       {self.agent.name}")
         log(f"model       {model} (effort {cfg.effort or 'agent default'})")
-        log(f"open      {' | '.join(self.ledger.open_labels()) or '(untracked plan)'}")
+        log(f"open        {' | '.join(self.ledger.open_labels()) or '(untracked plan)'}")
+        log(f"plan        {self.plan_rel} {fmt_size(self.file_size(self.plan))}; progress log "
+            f"{self.progress_rel} {fmt_size(self.file_size(self.progress))}")
         if dirty:
             log(f"NOTE: working tree already dirty ({len(dirty.splitlines())} paths) -- "
                 "the session is told to inspect it")
@@ -276,6 +293,7 @@ class Driver(SessionRunner):
             while True:
                 turn += 1
                 head_before = self.head()
+                plan_before = self.file_size(self.plan)
                 done_before = self.ledger.done_labels()
                 open_before = self.ledger.open_labels()
                 if resume_id:
@@ -293,6 +311,9 @@ class Driver(SessionRunner):
                     if len(done_after) > len(done_before) else []
                 status = res.loop_status
                 pct = res.ctx_pct(cfg.context_window)
+                plan_after = self.file_size(self.plan)
+                progress_after = self.file_size(self.progress)
+                res.plan_bytes, res.progress_bytes = plan_after, progress_after
                 state["total_cost_usd"] = round(state["total_cost_usd"] + res.cost_usd, 4)
 
                 log("")
@@ -300,7 +321,13 @@ class Driver(SessionRunner):
                 log(f"HEAD        {head_before[:12]} -> {head_after[:12]}"
                     + ("  (committed)" if committed else "  (NO COMMIT)"))
                 log(f"ticked      {' | '.join(landed) or '(none)'}")
+                log(f"plan        {fmt_size(plan_before)} -> {fmt_size(plan_after)} "
+                    f"({plan_after - plan_before:+d} B); progress log {fmt_size(progress_after)}")
                 log(f"LOOP_STATUS {status or '(none reported)'}")
+                if cfg.plan_growth_warn and plan_after - plan_before > cfg.plan_growth_warn:
+                    self.log(f"[{now()}] WARNING: the plan grew by {plan_after - plan_before} B "
+                             f"this turn (--plan-growth-warn {cfg.plan_growth_warn}); history "
+                             f"belongs in {self.progress_rel}, not in {self.plan_rel}")
 
                 # 1. Usage limit: not a failure. Bench this model and let the
                 #    outer loop rotate or sleep. A fresh session resumes the plan.
@@ -446,6 +473,13 @@ class Driver(SessionRunner):
         finally:
             log.close()
 
+    @staticmethod
+    def file_size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
     def _count(self, counted: bool, index: int) -> bool:
         if not counted:
             self.state["sessions"] = index
@@ -467,8 +501,20 @@ class Driver(SessionRunner):
             "ctx_tokens": res.ctx_tokens, "ctx_window": res.ctx_window,
             "ctx_pct": round(pct, 4) if pct is not None else None,
             "cost_usd": round(res.cost_usd, 4), "minutes": round(res.duration_s / 60, 1),
+            "plan_bytes": getattr(res, "plan_bytes", None),
+            "progress_bytes": getattr(res, "progress_bytes", None),
             "decision": decision,
         })
+
+
+def default_progress_file(plan: Path) -> Path:
+    """docs/PLAN.md -> docs/PLAN.progress.md, next to the plan."""
+    suffix = plan.suffix or ".md"
+    return plan.with_name(f"{plan.stem}.progress{suffix}")
+
+
+def fmt_size(n: int) -> str:
+    return f"{n / 1024:.1f} KB" if n >= 1024 else f"{n} B"
 
 
 # ----------------------------------------------------------------------- main
@@ -532,6 +578,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--append-prompt-file", action="append", metavar="FILE",
                    help="plan-specific instructions appended to the first prompt (repeatable)")
     g = p.add_argument_group("ledger")
+    g.add_argument("--progress-file", default="", metavar="FILE",
+                   help="the progress log sessions append to, one entry per milestone "
+                        "(default: next to the plan, docs/PLAN.md -> docs/PLAN.progress.md)")
+    g.add_argument("--plan-growth-warn", type=int, default=2000, metavar="BYTES",
+                   help="warn in driver.log when one turn grows the plan by more than this "
+                        "(history belongs in the progress log; 0 = off)")
     g.add_argument("--open-regex", default=DEFAULT_OPEN_RE,
                    help="multiline regex for an open plan item; group 1 is the label")
     g.add_argument("--done-regex", default=DEFAULT_DONE_RE,
@@ -608,6 +660,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FATAL: {exe[0]} is a .cmd/.bat shim and cmd.exe would mangle these "
               f"arguments: {unsafe}")
         return 2
+    if d.progress_rel.startswith("..") or d.progress == plan:
+        print(f"FATAL: --progress-file must be a file inside {repo}, other than the plan "
+              f"(got {d.progress})")
+        return 2
     if cfg.until and not d.ledger.until_found():
         print(f"FATAL: --until '{cfg.until}' matches no checklist item in {d.plan_rel}")
         return 2
@@ -628,7 +684,10 @@ def main(argv: list[str] | None = None) -> int:
 
     banner(log, f"AI Plan Loop -- {now()}")
     log(f"repo        {repo}")
-    log(f"plan        {d.plan_rel}" + (f" (until '{cfg.until}')" if cfg.until else ""))
+    log(f"plan        {d.plan_rel} {fmt_size(d.file_size(plan))}"
+        + (f" (until '{cfg.until}')" if cfg.until else ""))
+    log(f"progress    {d.progress_rel} "
+        + (fmt_size(d.file_size(d.progress)) if d.progress.exists() else "(not yet created)"))
     log(f"branch      {d.branch}")
     log(f"agent       {agent.name} ({' '.join(exe) or '?'}"
         + (f", {version}" if version else "") + f"; {chosen})")

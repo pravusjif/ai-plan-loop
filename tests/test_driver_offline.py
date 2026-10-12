@@ -40,7 +40,7 @@ class DriverOfflineTest(unittest.TestCase):
     def state(self):
         return json.loads((self.state_dir / "state.json").read_text(encoding="utf-8"))
 
-    def assert_plan_done(self, p, sessions):
+    def assert_plan_done(self, p, sessions, progress_rel="PLAN.progress.md"):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("PLAN COMPLETE", self.driver_log)
         self.assertFalse((self.state_dir / "HALTED").exists())
@@ -51,10 +51,17 @@ class DriverOfflineTest(unittest.TestCase):
                          ["milestone-1.txt", "milestone-2.txt", "milestone-3.txt"])
         self.assertEqual(int(git(self.repo, "rev-list", "--count", "HEAD")), 4)
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        progress = (self.repo / progress_rel).read_text(encoding="utf-8")
+        self.assertEqual(progress.count("\n## "), 2)
+        self.assertTrue(progress.startswith("## "), progress[:40])
+        self.assertIn(f"progress    {progress_rel} (not yet created)", self.driver_log)
         st = self.state()
         self.assertEqual(st["milestones"], 3)
         self.assertEqual(st["sessions"], sessions)
         self.assertEqual(len(st["history"]), 3)
+        self.assertEqual(st["history"][0]["plan_bytes"], len(PLAN.encode()))
+        self.assertEqual(st["history"][-1]["progress_bytes"], len(progress.encode()))
+        self.assertNotIn("WARNING: the plan grew", self.driver_log)
         return st
 
     def test_claude_resume_then_rotate(self):
@@ -72,6 +79,34 @@ class DriverOfflineTest(unittest.TestCase):
         self.assertEqual(h[0]["ctx_pct"], 0.01)
         self.assertEqual(st["total_cost_usd"], 0.03)
         self.assertEqual(len(list((self.state_dir / "logs").glob("*.jsonl"))), 2)
+
+    def test_progress_file_option(self):
+        p = self.run_loop("--agent", "claude", "--agent-bin", FAKE, "--model", "fake",
+                          "--fallback-model", "", "--progress-file", "docs/LOG.md")
+        self.assert_plan_done(p, sessions=1, progress_rel="docs/LOG.md")
+        self.assertFalse((self.repo / "PLAN.progress.md").exists())
+
+    def test_progress_file_must_be_in_repo_and_not_the_plan(self):
+        for bad in (str(self.repo.parent / "elsewhere.md"), "PLAN.md"):
+            with self.subTest(bad=bad):
+                p = self.run_loop("--agent", "claude", "--agent-bin", FAKE, "--model", "fake",
+                                  "--fallback-model", "", "--progress-file", bad)
+                self.assertEqual(p.returncode, 2, p.stdout)
+                self.assertIn("FATAL: --progress-file must be a file inside", p.stdout)
+
+    def test_plan_growth_warning(self):
+        args = ("--agent", "claude", "--agent-bin", FAKE, "--model", "fake",
+                "--fallback-model", "", "--max-milestones", "1")
+        p = self.run_loop(*args, env={"FAKE_AGENT_SCENARIO": "bloat"})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("WARNING: the plan grew by", self.driver_log)
+        self.assertIn("history belongs in PLAN.progress.md, not in PLAN.md", self.driver_log)
+        session_log = next((self.state_dir / "logs").glob("*.log")).read_text(encoding="utf-8")
+        self.assertRegex(session_log, r"plan        \d+ B -> 3\.\d KB \(\+3\d\d\d B\)")
+        self.assertGreater(self.state()["history"][0]["plan_bytes"], 3000)
+        p = self.run_loop(*args, "--plan-growth-warn", "0", env={"FAKE_AGENT_SCENARIO": "bloat"})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.driver_log.count("WARNING: the plan grew by"), 1)
 
     def test_claude_usage_limit_benches(self):
         before = time.time()

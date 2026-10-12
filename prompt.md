@@ -1,10 +1,11 @@
 We are working through the plan in {{PLAN_REF}}, unattended, on branch `{{BRANCH}}`.
 Read {{INSTRUCTIONS_FILES}} (if the repo has one) and {{PLAN_REF}} in full before touching anything. The plan
-says what to build, in what order, and how a milestone is verified and recorded. Where the plan
+says what to build, in what order, and how a milestone is verified and recorded. Then read the
+**last entry only** of `{{PROGRESS}}`, the progress log (it may not exist yet). Where the plan
 or the repo's own instructions are more specific than this prompt, follow them.
 
-Implement the next milestone (or task) in the plan that is not done yet, verify it, record it in
-the plan, and commit it. {{NEXT_HINT}} {{SCOPE}}
+Implement the next milestone (or task) in the plan that is not done yet, verify it, tick it in
+the plan, log it in `{{PROGRESS}}`, and commit it. {{NEXT_HINT}} {{SCOPE}}
 
 Any design question that would normally go to the user, you decide autonomously, the way the
 plan's existing decisions point. Record each such decision in {{PLAN}}.
@@ -15,8 +16,8 @@ plan's existing decisions point. Record each such decision in {{PLAN}}.
 
 You are one link in an unattended chain. A driver script (`plan_loop.py`)
 started this session and will start others after it. Nothing carries between sessions except
-what is on disk, so `{{PLAN}}` is not documentation of your work: it *is* the handoff. A
-milestone you land but do not write up is a milestone the next session redoes.
+what is on disk, so `{{PLAN}}` and `{{PROGRESS}}` are not documentation of your work: they *are*
+the handoff. A milestone you land but do not write up is a milestone the next session redoes.
 
 **One milestone per turn.** Do exactly one milestone, then end your turn with the
 `LOOP_STATUS` line below. Do not start a second one in the same turn, even if the first went
@@ -26,8 +27,31 @@ continues. That is the driver's decision, not yours.
 
 **Start by checking the working tree.** Run `git status` and `git log --oneline -5`. If the
 tree is dirty, a previous session was cut off mid-milestone (usage limit, timeout, crash). Read
-the diff, decide whether it is sound, and finish it or revert it deliberately. Never commit it
-blindly.
+the diff and that milestone's entry in `{{PROGRESS}}` if it has one, decide whether the work is
+sound, and finish it or revert it deliberately. Never commit it blindly.
+
+**Two files, two jobs.** Every session reads the whole plan, so the plan must stay the size of
+the work still ahead, not grow with the work behind.
+- `{{PLAN}}` holds what a *later* milestone needs: the spec, the checklist, the decisions
+  taken, verified facts, blockers. When you tick a milestone, its checklist line gets at most
+  one sentence saying what landed and the subject line of its commit. Nothing else about the
+  past goes into the plan: no evidence, no command output, no narrative.
+- `{{PROGRESS}}` holds the *past*: one entry per milestone, appended at the end, never edited
+  later. Create the file with your entry if it does not exist. Each entry has this shape, so
+  the next session can find it with the milestone's name:
+
+      ## <YYYY-MM-DD> <milestone label as it appears in the plan>
+      Commit: <the commit's subject line>
+      Delivered: <what exists now that did not before>
+      Verified: <the gate, the command, what you observed>
+      Open: <what is not done, what you ruled out and why, or "nothing">
+
+  Read it selectively: the last entry at the start of a session, and the entry of a specific
+  milestone only when the tree is dirty or the milestone you take was left `PARTIAL` or
+  blocked. Never read it in full.
+- If the plan still carries history paragraphs written before this rule, move them into
+  `{{PROGRESS}}` as you come across them, a few at a time in the same commit as your
+  milestone. Never make that a milestone of its own.
 
 **Scope.** Take the first milestone that is not done, honouring the dependencies the plan
 names. Do not silently substitute a different one: if it is genuinely blocked (it needs a human,
@@ -49,11 +73,12 @@ put a dated `COMMIT PENDING` note on the milestone in the plan, and report it.
 2. Builds, and its tests pass, using the commands the plan and {{INSTRUCTIONS_FILES}} give.
 3. Verified against the milestone's own gate, with evidence you actually observed: command
    output, readbacks, log lines. Never mark a milestone done on reasoning alone.
-4. The plan updated: the milestone ticked, what was delivered and how it was verified, any new
-   verified facts in the section the plan keeps for them, and any autonomous decision with the
-   date and a one-line reason.
-5. Every other doc the repo says must track the change updated in the same commit.
-6. Committed.
+4. The plan updated: the milestone ticked with its one-line summary, any new verified facts in
+   the section the plan keeps for them, and any autonomous decision with the date and a
+   one-line reason.
+5. The progress log `{{PROGRESS}}` extended with the milestone's entry, in the shape above.
+6. Every other doc the repo says must track the change updated in the same commit.
+7. Committed.
 
 **Honest over optimistic.** If you cannot land it, leave the plan saying exactly what is done,
 what is open and what you ruled out. Commit whatever is safe to commit. A wrong "done" costs the

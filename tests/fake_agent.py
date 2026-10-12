@@ -5,12 +5,14 @@ plan, write a file, commit -- and reports it in the output format of the agent
 it imitates. Driven by environment variables (the driver passes them through):
 
   FAKE_AGENT_FORMAT    claude | codex | gemini | text      (default claude)
-  FAKE_AGENT_SCENARIO  ok | limit                          (default ok)
+  FAKE_AGENT_SCENARIO  ok | limit | bloat                  (default ok)
   FAKE_AGENT_ECHO      1: echo the prompt first (text format only)
   FAKE_AGENT_ROLLOUT   1: codex format also writes a rollout file in $CODEX_HOME
 
 The `limit` scenario reports a usage limit in that agent's words, does no work,
-and creates the plan's STOP file so the driver stops instead of sleeping.
+and creates the plan's STOP file so the driver stops instead of sleeping. The
+`bloat` scenario lands the milestone but writes its history into the plan
+instead of the progress log, which the driver should warn about.
 """
 
 from __future__ import annotations
@@ -46,17 +48,22 @@ def session_id(fmt: str, argv: list[str]) -> str:
     return str(uuid.uuid4())
 
 
-def do_milestone(plan: Path) -> str | None:
-    """Tick the next open item, write a file, commit. Returns its label."""
+def do_milestone(plan: Path, progress: Path, bloat: bool) -> str | None:
+    """Tick the next open item, write a file, log it, commit. Returns its label."""
     text = plan.read_text(encoding="utf-8")
     m = OPEN_RE.search(text)
     if not m:
         return None
     label = " ".join(m.group(2).replace("**", "").split())
-    plan.write_text(text[:m.start()] + f"{m.group(1)} [x] {m.group(2)}" + text[m.end():],
-                    encoding="utf-8", newline="\n")
+    history = f"\n  Delivered by the fake agent. Verified: {'blah ' * 600}\n" if bloat else ""
+    plan.write_text(text[:m.start()] + f"{m.group(1)} [x] {m.group(2)}" + history
+                    + text[m.end():], encoding="utf-8", newline="\n")
     n = len(list(Path.cwd().glob("milestone-*.txt"))) + 1
     Path(f"milestone-{n}.txt").write_text(f"{label}\n", encoding="utf-8")
+    progress.parent.mkdir(parents=True, exist_ok=True)
+    with progress.open("a", encoding="utf-8", newline="\n") as fh:
+        fh.write(f"## {datetime.now():%Y-%m-%d} {label}\nCommit: fake: {label}\n"
+                 f"Delivered: milestone-{n}.txt\nVerified: it exists\nOpen: nothing\n\n")
     subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", f"fake: {label}"], check=True,
                    capture_output=True)
@@ -123,7 +130,8 @@ def main() -> int:
             print("Error: usage limit reached, try again in 45 minutes", flush=True)
         return 1
 
-    label = do_milestone(Path(plan_rel))
+    label = do_milestone(Path(plan_rel), Path(os.environ["AI_PLAN_LOOP_PROGRESS"]),
+                         scenario == "bloat")
     final = (f"Did {label}.\nLOOP_STATUS: LANDED {label}" if label
              else "Nothing left.\nLOOP_STATUS: PLAN_COMPLETE")
 

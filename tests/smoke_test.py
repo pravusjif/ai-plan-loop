@@ -92,6 +92,10 @@ def smoke(agent: str, keep: bool, extra: list[str]) -> bool:
         # 2. the ledger
         plan = (repo / "PLAN.md").read_text(encoding="utf-8")
         check(plan.count("- [x]") == 3 and plan.count("- [ ]") == 0, "all 3 boxes ticked")
+        log = (repo / "PLAN.progress.md")
+        entries = log.read_text(encoding="utf-8").count("
+## ") + 1 if log.exists() else 0
+        check(entries == 3, f"3 entries in PLAN.progress.md (got {entries})")
         # 3. the work itself; milestone 3 depends on 1 and 2
         read = lambda name: (repo / name).read_text(encoding="utf-8").strip() \
             if (repo / name).exists() else None  # noqa: E731

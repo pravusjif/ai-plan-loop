@@ -32,10 +32,29 @@ class PromptTest(unittest.TestCase):
                 want = (FIXTURES / golden).read_text(encoding="utf-8")
                 self.assertEqual(prompt_sections(out), want)
 
+    def test_progress_log_and_checklist(self):
+        out = self.dry("--agent", "claude", "--agent-bin", FAKE)
+        first, cont = prompt_sections(out).split("--- continue prompt")
+        self.assertIn("progress    docs/PLAN.progress.md (not yet created)", out)
+        self.assertIn("**last entry only** of `docs/PLAN.progress.md`", first)
+        self.assertIn("5. The progress log `docs/PLAN.progress.md` extended", first)
+        # The continue prompt carries the ledger's view, so the session need not
+        # re-read the plan; a 70-char label cap keeps it short.
+        self.assertIn("- [x] 1. Done already. Nothing to do.\n- [ ] 2. Scripts. Write the "
+                      "scripts.\n- [ ] 3. Build. Build it.\n", cont)
+        self.assertIn("Do not re-read the plan in full", cont)
+        self.assertNotIn("@docs/PLAN.progress.md", first + cont)
+        out = self.dry("--agent", "claude", "--agent-bin", FAKE, "--progress-file", "docs/LOG.md",
+                       "--until", "2. Scripts")
+        self.assertIn("appended to `docs/LOG.md`", out)
+        self.assertNotIn("PLAN.progress.md", out)
+        self.assertNotIn("3. Build", out.split("--- continue prompt")[1])
+
     def test_codex_prompt(self):
         out = self.dry("--agent", "codex", "--agent-bin", FAKE)
         prompts = prompt_sections(out)
         self.assertIn("the plan in docs/PLAN.md, unattended", prompts)
+        self.assertIn("`docs/PLAN.progress.md`, the progress log", prompts)
         self.assertNotIn("@docs/PLAN.md", prompts)
         self.assertIn("Read AGENTS.md (if the repo has one)", prompts)
         self.assertNotIn("CLAUDE.md", prompts)
