@@ -107,4 +107,6 @@ reads:
     LOOP_STATUS: BLOCKED — <one-line reason>
     LOOP_STATUS: PLAN_COMPLETE
 
-Use `PLAN_COMPLETE` only when no milestone in scope is left open.
+Use `PLAN_COMPLETE` only when no milestone in scope is left open. Use `BLOCKED` only when no
+open milestone in scope can be taken without a human: the driver stops the chain on it and
+waits for the owner.

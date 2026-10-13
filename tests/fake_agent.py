@@ -5,14 +5,15 @@ plan, write a file, commit -- and reports it in the output format of the agent
 it imitates. Driven by environment variables (the driver passes them through):
 
   FAKE_AGENT_FORMAT    claude | codex | gemini | text      (default claude)
-  FAKE_AGENT_SCENARIO  ok | limit | bloat                  (default ok)
+  FAKE_AGENT_SCENARIO  ok | limit | bloat | blocked        (default ok)
   FAKE_AGENT_ECHO      1: echo the prompt first (text format only)
   FAKE_AGENT_ROLLOUT   1: codex format also writes a rollout file in $CODEX_HOME
 
 The `limit` scenario reports a usage limit in that agent's words, does no work,
 and creates the plan's STOP file so the driver stops instead of sleeping. The
 `bloat` scenario lands the milestone but writes its history into the plan
-instead of the progress log, which the driver should warn about.
+instead of the progress log, which the driver should warn about. The `blocked`
+scenario does no work and reports `LOOP_STATUS: BLOCKED`.
 """
 
 from __future__ import annotations
@@ -130,10 +131,13 @@ def main() -> int:
             print("Error: usage limit reached, try again in 45 minutes", flush=True)
         return 1
 
-    label = do_milestone(Path(plan_rel), Path(os.environ["AI_PLAN_LOOP_PROGRESS"]),
-                         scenario == "bloat")
-    final = (f"Did {label}.\nLOOP_STATUS: LANDED {label}" if label
-             else "Nothing left.\nLOOP_STATUS: PLAN_COMPLETE")
+    if scenario == "blocked":
+        final = "Only the owner can do the next item.\nLOOP_STATUS: BLOCKED — needs the owner"
+    else:
+        label = do_milestone(Path(plan_rel), Path(os.environ["AI_PLAN_LOOP_PROGRESS"]),
+                             scenario == "bloat")
+        final = (f"Did {label}.\nLOOP_STATUS: LANDED {label}" if label
+                 else "Nothing left.\nLOOP_STATUS: PLAN_COMPLETE")
 
     if fmt == "claude":
         emit({"type": "system", "subtype": "init", "session_id": sid, "model": "fake-model"})

@@ -108,6 +108,25 @@ class DriverOfflineTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.driver_log.count("WARNING: the plan grew by"), 1)
 
+    def test_blocked_waits_for_a_human(self):
+        args = ("--agent", "claude", "--agent-bin", FAKE, "--model", "fake",
+                "--fallback-model", "")
+        p = self.run_loop(*args, env={"FAKE_AGENT_SCENARIO": "blocked"})
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn("WAITING ON A HUMAN -- BLOCKED — needs the owner", self.driver_log)
+        self.assertIn("Open: 1. One. First. | 2. Two. Second. | 3. Three. Third.",
+                      self.driver_log)
+        self.assertNotIn("STALLED", self.driver_log)
+        self.assertFalse((self.state_dir / "HALTED").exists())
+        st = self.state()
+        self.assertEqual(st["sessions"], 1)
+        self.assertEqual(st["consecutive_stalls"], 0)
+        self.assertEqual(st["history"][-1]["decision"], "blocked -> waiting on a human")
+        # The owner cleared the blocker: a plain restart picks the plan up.
+        p = self.run_loop(*args)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("PLAN COMPLETE", self.driver_log)
+
     def test_claude_usage_limit_benches(self):
         before = time.time()
         p = self.run_loop("--agent", "claude", "--agent-bin", FAKE, "--model", "fake",

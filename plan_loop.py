@@ -31,6 +31,8 @@ The rules (README.md has the reasoning):
     the earliest reset, re-probing at a low frequency when no time is known.
   * Progress is judged by the repo, not by what the session says: a commit, or a
     checkbox ticked in the plan. Two turns in a row without either halt the chain.
+  * A turn ending `LOOP_STATUS: BLOCKED` (nothing in scope can be taken without a
+    human) stops the chain with exit code 3 and no HALTED file.
 
 Each turn is a separate agent process. Nothing carries between sessions except
 what is on disk: the plan, its progress log (<plan>.progress.md, one entry per
@@ -70,6 +72,10 @@ DEFAULT_CONTINUE = HERE / "continue.md"
 # count as separate milestones.
 DEFAULT_OPEN_RE = r"^[-*+] \[ \] (.+)$"
 DEFAULT_DONE_RE = r"^[-*+] \[[xX]\] (.+)$"
+
+# Exit code when a session reports LOOP_STATUS: BLOCKED (0 done or stopped,
+# 1 halted, 2 refused to start, 130 Ctrl-C).
+EXIT_BLOCKED = 3
 
 
 # --------------------------------------------------------------------- ledger
@@ -149,6 +155,7 @@ class Driver(SessionRunner):
         self.branch = ""
         self.ran_this_run = 0
         self.milestones_this_run = 0
+        self.blocked = ""
 
     # --- prompts ------------------------------------------------------------
 
@@ -251,6 +258,12 @@ class Driver(SessionRunner):
                 return 0
             if outcome == "stop":
                 return 0
+            if outcome == "blocked":
+                banner(self.log, f"WAITING ON A HUMAN -- {self.blocked}")
+                self.log(f"Open: {' | '.join(self.ledger.open_labels()) or '(untracked plan)'}")
+                self.log("Clear the blocker the plan names, then restart: there is no HALTED "
+                         "file to delete.")
+                return EXIT_BLOCKED
             if outcome == "overload":
                 back = min(300 * 2 ** (self.state["consecutive_errors"] - 1), 3600)
                 self.log(f"[{now()}] API overloaded -- backing off {fmt_dur(back)}")
@@ -402,7 +415,23 @@ class Driver(SessionRunner):
                         self._milestone()
                     return "done"
 
-                # 6. Progress, judged by the repo: a commit or a ticked item.
+                # 6. Blocked: the session says no milestone in scope can be taken
+                #    without a human. Another session would only rediscover that,
+                #    so stop and wait. Not a halt: the blocker is the plan's, not
+                #    the chain's, and a restart needs nothing deleted.
+                if status.upper().startswith("BLOCKED"):
+                    state["consecutive_stalls"] = 0
+                    if landed:
+                        self._milestone()
+                    self._history(index, turn, model, res, status, committed, landed, pct,
+                                  "blocked -> waiting on a human")
+                    self.log(f"[{now()}] session #{index} turn {turn} BLOCKED on '{model}' -- "
+                             f"{status} | committed: {'yes' if committed else 'no'} | "
+                             f"{res.duration_s / 60:.0f} min | ${res.cost_usd:.2f}")
+                    self.blocked = status
+                    return "blocked"
+
+                # 7. Progress, judged by the repo: a commit or a ticked item.
                 #    What the session SAYS it did is recorded, not trusted.
                 progressed = committed or bool(landed)
                 if not progressed:
@@ -421,8 +450,8 @@ class Driver(SessionRunner):
 
                 reached = status.upper().startswith("LANDED") or bool(landed)
                 if not reached:
-                    # PARTIAL / BLOCKED / no status: progress, but the milestone is
-                    # not closed. A fresh context takes the next attempt.
+                    # PARTIAL / no status: progress, but the milestone is not
+                    # closed. A fresh context takes the next attempt.
                     self._history(index, turn, model, res, status, committed, landed, pct,
                                   "progress, milestone open -> fresh session")
                     self.log(f"[{now()}] session #{index} turn {turn}: progress but no milestone "
@@ -435,7 +464,7 @@ class Driver(SessionRunner):
                          f"| {res.duration_s / 60:.0f} min | ${res.cost_usd:.2f} | "
                          f"context {self.ctx_text(res)}")
 
-                # 7. Checkpoint: stop here if asked to.
+                # 8. Checkpoint: stop here if asked to.
                 if self.stop_file.exists():
                     self._history(index, turn, model, res, status, committed, landed, pct, "STOP")
                     banner(self.log, "STOP file present -- stopping after this milestone")
@@ -446,7 +475,7 @@ class Driver(SessionRunner):
                     banner(self.log, f"reached --max-milestones {cfg.max_milestones}")
                     return "stop"
 
-                # 8. Checkpoint: the context rule.
+                # 9. Checkpoint: the context rule.
                 limit = self.threshold()
                 if not self.agent.supports_resume:
                     decision = f"{self.agent.name} cannot resume a session -> fresh session"

@@ -118,8 +118,8 @@ newline.
      the next milestone starts in a **fresh** session.
 
    The check happens only at checkpoints and never cuts a milestone in half. A turn that ends
-   without closing a milestone (`PARTIAL`, `BLOCKED`, or no status) always rotates, because a
-   fresh context is the better second attempt. Set the threshold with `--context-threshold`.
+   without closing a milestone (`PARTIAL` or no status) always rotates, because a fresh
+   context is the better second attempt. Set the threshold with `--context-threshold`.
 6. **Usage limits.** A usage limit is not counted as a failure. The limited model is benched
    until the server's reset time, and the other model takes over immediately. When every model
    is benched, the driver sleeps until the earliest reset and then starts a fresh session.
@@ -148,8 +148,19 @@ newline.
    - the branch changed under it
    - no model in the chain is available
    - `--preflight` never passed
-9. **Finish.** The run finishes when every checklist item in scope is ticked, or a session
-   reports `LOOP_STATUS: PLAN_COMPLETE`.
+9. **When it waits for a human.** A session that ends with `LOOP_STATUS: BLOCKED` is saying
+   no open milestone in scope can be taken without a human: an owner's decision, a manual
+   step, a live run only the owner can start. Another session would only find the same
+   thing, so the driver stops at once with `WAITING ON A HUMAN`, the reason and the open
+   items, and exit code 3. This is not a halt: it writes no `HALTED` file and resets the stall
+   count, so once the blocker is cleared a plain restart picks the plan up. A milestone that
+   is blocked while a later one is not is a swap, not `BLOCKED`: the session marks it in the
+   plan and lands the other one.
+10. **Finish.** The run finishes when every checklist item in scope is ticked, or a session
+    reports `LOOP_STATUS: PLAN_COMPLETE`.
+
+Exit codes: `0` done or stopped (`STOP`, `--max-*`), `1` halted, `2` refused to start, `3`
+waiting on a human, `130` Ctrl-C.
 
 ## Architecture
 
@@ -173,6 +184,7 @@ plan_loop.py docs/PLAN.md
            fast failure      → bench M 5→60 min (growing)   → back to outer loop
            hard error        → count; overload backoff / cooldown; halt at 3
            plan complete     → exit 0
+           BLOCKED           → wait for a human: exit 3, no HALTED
            no commit, no tick→ stall; halt at 2             → fresh session
            progress, milestone not closed                   → fresh session
            milestone landed  → CHECKPOINT:
