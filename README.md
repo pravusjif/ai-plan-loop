@@ -37,9 +37,10 @@ python <REPO-CLONE-PARENT>\ai_plan_loop\plan_loop.py docs\PLAN.md --agent codex 
 | After the current milestone | Create `.ai-loop\<plan>\STOP`, for example `.ai-loop\docs-PLAN-md\STOP`. It also interrupts a usage-limit wait. |
 | Right now | Press `Ctrl-C`. This kills the running session's process tree. Its uncommitted work stays in the tree, and the next session is told to inspect it. |
 
-Restarting is safe and resumes from `state.json`, including model benches. Delete the `HALTED`
-file first if the previous run halted. Only one driver can run per repo, enforced by an OS lock
-on `.ai-loop/driver.lock`, because every session shares the working tree and the git index.
+Restarting is safe and resumes from `state.json`, except model benches: a restart clears them
+so the first session re-checks the quota. Delete the `HALTED` file first if the previous run
+halted. Only one driver can run per repo, enforced by an OS lock on `.ai-loop/driver.lock`,
+because every session shares the working tree and the git index.
 
 ## Agents
 

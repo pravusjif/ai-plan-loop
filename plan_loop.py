@@ -726,16 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         log("ledger      no checklist items matched -- progress is judged by commits and "
             "LOOP_STATUS only (see --open-regex/--done-regex)")
-    lim = {m: t for m, t in d.limited_until().items() if float(t) > time.time()}
-    if lim:
-        log("benched     " + ", ".join(f"{m} until {fmt_epoch(float(t))}" for m, t in lim.items())
-            + ("" if cfg.dry_run else " -- cleared: a restart re-checks the quota"))
-    # A restart is the user's say-so that the quota may have changed (extra usage
-    # bought, plan upgraded, window reset early). A limited model fails its first
-    # call within seconds and is benched again, so re-checking is cheap; trusting
-    # a stale bench can idle the loop for hours.
-    if not cfg.dry_run:
-        d.limited_until().clear()
+    d.clear_benches(cfg.dry_run)
 
     if cfg.dry_run:
         log("")

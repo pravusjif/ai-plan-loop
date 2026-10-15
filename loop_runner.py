@@ -222,6 +222,20 @@ class SessionRunner:
     def limited_until(self) -> dict:
         return self.state.setdefault("limited_until", {})
 
+    def clear_benches(self, dry_run: bool) -> None:
+        """Log the benches saved in state.json and drop them. A restart is the
+        user's say-so that the quota may have changed (extra usage bought, plan
+        upgraded, window reset early). A limited model fails its first call within
+        seconds and is benched again, so re-checking is cheap; trusting a stale
+        bench can idle the loop for hours."""
+        lim = {m: t for m, t in self.limited_until().items() if float(t) > time.time()}
+        if lim:
+            self.log("benched     " + ", ".join(f"{m} until {fmt_epoch(float(t))}"
+                                               for m, t in lim.items())
+                     + ("" if dry_run else " -- cleared: a restart re-checks the quota"))
+        if not dry_run:
+            self.limited_until().clear()
+
     def ensure_git_exclude(self) -> None:
         """Sessions run `git add` unattended; the loop's own output must never be
         staged. info/exclude is untracked, so no session can commit it away."""
